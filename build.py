@@ -273,7 +273,7 @@ a = Analysis(
 import re as _re
 import os as _os
 
-_lib_pat = _re.compile("@@LIB_PAT@@")
+_lib_pat = _re.compile(r"@@LIB_PAT@@")
 _plugin_keep = @@PLUGIN_KEEP@@
 _plugin_drop_dirs = @@PLUGIN_DROP_DIRS@@
 _trans_dirs = @@TRANSLATION_DIRS@@
@@ -307,12 +307,17 @@ for _toc in (a.binaries, a.datas):
     print(f"[spec] pruned {_toc is a.binaries and 'binaries' or 'datas'}: "
           f"{_before} -> {len(_toc)}")
 
+print("[spec] surviving plugin/icon datas:",
+      [d[0] for d in a.datas if "plugins" in d[0].replace("\\", "/").lower()
+       or d[0].lower().endswith(".svg")])
+
 # ---------------------------------------------------------------- build
 pyz = PYZ(a.pure, a.zipped_data, cipher=None)
 
 exe = EXE(
     pyz,
     a.scripts,
+    @@EXE_BUNDLE_ARGS@@
     [],
     exclude_binaries=@@EXCLUDE_BINARIES@@,
     name=@@APP_NAME@@,
@@ -390,6 +395,10 @@ def make_spec(gui_console: bool, onedir: bool, use_upx: bool,
 
     datas = [f"(r'{ICON_SVG}', '.')"]
     datas += [f"(r'{src}', '{dest}')" for src, dest in plugin_datas()]
+    # Onefile (exclude_binaries=False) must embed a.binaries/zipfiles/datas
+    # directly into EXE() -- there's no COLLECT() step to carry them
+    # otherwise, which is exactly the bug that shipped a binary-less exe.
+    exe_bundle_args = "" if onedir else "a.binaries,\n    a.zipfiles,\n    a.datas,\n    "
 
     spec = (_SPEC
             .replace("@@ENTRY@@", str(APP_ENTRY))
@@ -401,6 +410,7 @@ def make_spec(gui_console: bool, onedir: bool, use_upx: bool,
             .replace("@@PLUGIN_DROP_DIRS@@", repr(QT_PLUGIN_DROP_DIRS))
             .replace("@@TRANSLATION_DIRS@@", repr(list(QT_TRANSLATION_DIRNAMES)))
             .replace("@@EXCLUDE_BINARIES@@", repr(onedir))
+            .replace("@@EXE_BUNDLE_ARGS@@", exe_bundle_args)
             .replace("@@APP_NAME@@", ascii(APP_NAME))
             .replace("@@UPX@@", repr(use_upx))
             .replace("@@CONSOLE@@", repr(gui_console))
