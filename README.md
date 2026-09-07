@@ -1,4 +1,8 @@
-# Animation Studio - Prototype
+# FUNNY ANIMATION SOFTWARE!!
+
+## Make funny animation cartoons in this funny animation software
+
+It's simple***, you open it, make a funny cartoon and render it as a video!!
 
 A tiny 2D vector/cutout animation prototype built with Python + PySide6 (Qt6).
 
