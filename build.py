@@ -302,7 +302,10 @@ def _should_drop(dest, name):
     return False
 
 for _toc in (a.binaries, a.datas):
+    _before = len(_toc)
     _toc[:] = [_e for _e in _toc if not _should_drop(_e[0], _e[0] or _e[1])]
+    print(f"[spec] pruned {_toc is a.binaries and 'binaries' or 'datas'}: "
+          f"{_before} -> {len(_toc)}")
 
 # ---------------------------------------------------------------- build
 pyz = PYZ(a.pure, a.zipped_data, cipher=None)
@@ -626,8 +629,9 @@ def build_appimage(app_dir: Path, png: Path | None) -> Path:
 
 def smoke_test(exe: Path, label: str) -> None:
     """Run the built app a few seconds. Timeout(exit 124) == event loop ran;
-    SIGSEGV == a prune cut something actually needed."""
-    for platform in ("offscreen", "xcb"):
+    SIGSEGV/crash == a prune cut something actually needed."""
+    platforms = ("offscreen", "windows") if os.name == "nt" else ("offscreen", "xcb")
+    for platform in platforms:
         env = dict(os.environ, QT_QPA_PLATFORM=platform)
         if exe.name.endswith(".AppImage"):
             env["APPIMAGE_EXTRACT_AND_RUN"] = "1"  # avoids needing FUSE
@@ -721,7 +725,11 @@ def main(argv=None) -> int:
         smoke_test(appimage, "appimage")
         final = (("Linux dist dir", app_dir), ("Linux AppImage", appimage))
     else:
-        final = (("Windows portable .exe", exe),)
+        RELEASE_DIR.mkdir(parents=True, exist_ok=True)
+        released = RELEASE_DIR / exe.name
+        shutil.copy2(exe, released)
+        smoke_test(released, "windows-exe")
+        final = (("Windows portable .exe", released),)
 
     log("=" * 62)
     log("BUILD COMPLETE")
