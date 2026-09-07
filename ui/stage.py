@@ -3,7 +3,9 @@ from __future__ import annotations
 import os
 import sys
 
-os.environ["QT_QPA_PLATFORM"] = "xcb"
+import sys
+if sys.platform.startswith("linux"):
+    os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 import math
 import weakref
