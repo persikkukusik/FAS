@@ -731,7 +731,7 @@ def main(argv=None) -> int:
     ico = make_ico(png, BUILD_DIR)
 
     onedir = target == "linux"
-    console = True                       # show stderr on Linux; windowed on Win
+    console = False if target == "windows" else True
     use_upx = target == "windows" and not args.no_upx and bool(shutil.which("upx"))
     if target == "windows" and not args.no_upx and not use_upx:
         log("UPX not found on PATH; building without it")
