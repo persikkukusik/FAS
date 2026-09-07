@@ -637,9 +637,27 @@ def build_appimage(app_dir: Path, png: Path | None) -> Path:
 # Smoke tests
 # --------------------------------------------------------------------------
 
+def _force_kill(proc: subprocess.Popen) -> None:
+    """Kill the whole process tree, not just the immediate child.
+
+    On Windows a GUI process can survive a plain proc.kill() (which only
+    signals the direct child), leaving the CI job hung indefinitely.
+    taskkill /T walks the tree; on POSIX proc.kill() is sufficient.
+    """
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        proc.kill()
+    try:
+        proc.wait(timeout=5)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def smoke_test(exe: Path, label: str) -> None:
-    """Run the built app a few seconds. Timeout(exit 124) == event loop ran;
-    SIGSEGV/crash == a prune cut something actually needed."""
+    """Run the built app a few seconds. Timeout == event loop ran (OK);
+    crash/nonzero exit == a prune cut something actually needed."""
     platforms = ("offscreen", "windows") if os.name == "nt" else ("offscreen", "xcb")
     for platform in platforms:
         env = dict(os.environ, QT_QPA_PLATFORM=platform)
@@ -647,17 +665,18 @@ def smoke_test(exe: Path, label: str) -> None:
             env["APPIMAGE_EXTRACT_AND_RUN"] = "1"  # avoids needing FUSE
         base = ["xvfb-run", "-a"] if shutil.which("xvfb-run") else []
         cmd = base + [str(exe)]
+        log("+ " + " ".join(str(c) for c in cmd))
+        proc = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.PIPE)
         try:
-            p = run(cmd, env=env, timeout=10,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            if p.returncode in (124,):       # we killed it -- it was running
-                log(f"  [{label}/{platform}] OK (ran the event loop)")
-            elif p.returncode == 0:
+            _, stderr = proc.communicate(timeout=10)
+            if proc.returncode == 0:
                 log(f"  [{label}/{platform}] exited cleanly (OK)")
             else:
-                log(f"  [{label}/{platform}] exit {p.returncode}")
-                log("    stderr: " + p.stderr.decode(errors="replace").strip()[-800:])
+                log(f"  [{label}/{platform}] exit {proc.returncode}")
+                log("    stderr: " + stderr.decode(errors="replace").strip()[-800:])
         except subprocess.TimeoutExpired:
+            _force_kill(proc)
             log(f"  [{label}/{platform}] OK (ran the event loop)")
 
 
