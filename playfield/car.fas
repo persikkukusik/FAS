@@ -1,0 +1,349 @@
+{
+  "fas_version": 1,
+  "start_frame": 0,
+  "end_frame": 52,
+  "fps": 60,
+  "current_frame": 12,
+  "objects": [
+    {
+      "id": "c10069e5",
+      "name": "Scene",
+      "shape_type": "container",
+      "shape_data": {},
+      "transform": {
+        "x": 0.0,
+        "y": 0.0,
+        "rotation": 0.0,
+        "scale_x": 1.0,
+        "scale_y": 1.0
+      },
+      "color": "#cccccc",
+      "opacity": 1.0,
+      "visible": true,
+      "locked": false,
+      "is_mask": false,
+      "mask_mode": "wrap",
+      "keyframes": {},
+      "children": [
+        {
+          "id": "5f4b94c5",
+          "name": "Car",
+          "shape_type": "container",
+          "shape_data": {},
+          "transform": {
+            "x": 132.39421541371155,
+            "y": 328.50126241134745,
+            "rotation": -3.7372664488625094,
+            "scale_x": 1.0,
+            "scale_y": 1.0
+          },
+          "color": "#cccccc",
+          "opacity": 1.0,
+          "visible": true,
+          "locked": false,
+          "is_mask": false,
+          "mask_mode": "wrap",
+          "keyframes": {
+            "position_x": [
+              {
+                "frame": 0,
+                "value": 89.85342789598104,
+                "interpolation": "cubic"
+              },
+              {
+                "frame": 30,
+                "value": 224.15248226950354,
+                "interpolation": "cubic"
+              },
+              {
+                "frame": 39,
+                "value": 273.8753380614657,
+                "interpolation": "cubic"
+              },
+              {
+                "frame": 60,
+                "value": 320,
+                "interpolation": "cubic"
+              }
+            ],
+            "position_y": [
+              {
+                "frame": 0,
+                "value": 306.4018912529551,
+                "interpolation": "cubic"
+              },
+              {
+                "frame": 30,
+                "value": 358.52304964539,
+                "interpolation": "cubic"
+              },
+              {
+                "frame": 39,
+                "value": 296.55527511820316,
+                "interpolation": "cubic"
+              },
+              {
+                "frame": 60,
+                "value": 260,
+                "interpolation": "cubic"
+              }
+            ],
+            "rotation": [
+              {
+                "frame": 0,
+                "value": 1.4144794133983982,
+                "interpolation": "cubic"
+              },
+              {
+                "frame": 30,
+                "value": -10.735864601367894,
+                "interpolation": "cubic"
+              },
+              {
+                "frame": 39,
+                "value": 4.102736731388642,
+                "interpolation": "cubic"
+              },
+              {
+                "frame": 60,
+                "value": -6,
+                "interpolation": "cubic"
+              }
+            ],
+            "scale_x": [
+              {
+                "frame": 0,
+                "value": 1.0,
+                "interpolation": "cubic"
+              },
+              {
+                "frame": 30,
+                "value": 1.0,
+                "interpolation": "cubic"
+              },
+              {
+                "frame": 39,
+                "value": 0.9999999999999998,
+                "interpolation": "cubic"
+              },
+              {
+                "frame": 60,
+                "value": 1.0,
+                "interpolation": "cubic"
+              }
+            ],
+            "scale_y": [
+              {
+                "frame": 0,
+                "value": 1.0,
+                "interpolation": "cubic"
+              },
+              {
+                "frame": 30,
+                "value": 1.0,
+                "interpolation": "cubic"
+              },
+              {
+                "frame": 39,
+                "value": 0.9999999999999998,
+                "interpolation": "cubic"
+              },
+              {
+                "frame": 60,
+                "value": 1.0,
+                "interpolation": "cubic"
+              }
+            ]
+          },
+          "children": [
+            {
+              "id": "f4b73536",
+              "name": "Chassis",
+              "shape_type": "rect",
+              "shape_data": {
+                "width": 140,
+                "height": 55
+              },
+              "transform": {
+                "x": 0,
+                "y": 0,
+                "rotation": 0.0,
+                "scale_x": 1.0,
+                "scale_y": 1.0
+              },
+              "color": "#8a8a7a",
+              "opacity": 1.0,
+              "visible": true,
+              "locked": false,
+              "is_mask": false,
+              "mask_mode": "wrap",
+              "keyframes": {},
+              "children": [],
+              "expanded": true
+            },
+            {
+              "id": "eebfe3d0",
+              "name": "Wheel FL",
+              "shape_type": "circle",
+              "shape_data": {
+                "radius": 14
+              },
+              "transform": {
+                "x": -55,
+                "y": 32,
+                "rotation": 0.0,
+                "scale_x": 1.0,
+                "scale_y": 1.0
+              },
+              "color": "#222222",
+              "opacity": 1.0,
+              "visible": true,
+              "locked": false,
+              "is_mask": false,
+              "mask_mode": "wrap",
+              "keyframes": {},
+              "children": [],
+              "expanded": true
+            },
+            {
+              "id": "19b12897",
+              "name": "Wheel FR",
+              "shape_type": "circle",
+              "shape_data": {
+                "radius": 14
+              },
+              "transform": {
+                "x": 55,
+                "y": 32,
+                "rotation": 0.0,
+                "scale_x": 1.0,
+                "scale_y": 1.0
+              },
+              "color": "#222222",
+              "opacity": 1.0,
+              "visible": true,
+              "locked": false,
+              "is_mask": false,
+              "mask_mode": "wrap",
+              "keyframes": {},
+              "children": [],
+              "expanded": true
+            },
+            {
+              "id": "21e18e30",
+              "name": "Turret",
+              "shape_type": "circle",
+              "shape_data": {
+                "radius": 12
+              },
+              "transform": {
+                "x": -20.0,
+                "y": -32.0,
+                "rotation": 59.04,
+                "scale_x": 1.0,
+                "scale_y": 1.0
+              },
+              "color": "#c8933a",
+              "opacity": 1.0,
+              "visible": true,
+              "locked": false,
+              "is_mask": false,
+              "mask_mode": "wrap",
+              "keyframes": {
+                "position_x": [
+                  {
+                    "frame": 0,
+                    "value": -20,
+                    "interpolation": "cubic"
+                  },
+                  {
+                    "frame": 30,
+                    "value": -20,
+                    "interpolation": "cubic"
+                  },
+                  {
+                    "frame": 60,
+                    "value": -20,
+                    "interpolation": "cubic"
+                  }
+                ],
+                "position_y": [
+                  {
+                    "frame": 0,
+                    "value": -32,
+                    "interpolation": "cubic"
+                  },
+                  {
+                    "frame": 30,
+                    "value": -32,
+                    "interpolation": "cubic"
+                  },
+                  {
+                    "frame": 60,
+                    "value": -32,
+                    "interpolation": "cubic"
+                  }
+                ],
+                "rotation": [
+                  {
+                    "frame": 0,
+                    "value": 0.0,
+                    "interpolation": "cubic"
+                  },
+                  {
+                    "frame": 30,
+                    "value": 180,
+                    "interpolation": "cubic"
+                  },
+                  {
+                    "frame": 60,
+                    "value": 360,
+                    "interpolation": "cubic"
+                  }
+                ],
+                "scale_x": [
+                  {
+                    "frame": 0,
+                    "value": 1.0,
+                    "interpolation": "cubic"
+                  },
+                  {
+                    "frame": 30,
+                    "value": 1.0,
+                    "interpolation": "cubic"
+                  },
+                  {
+                    "frame": 60,
+                    "value": 1.0,
+                    "interpolation": "cubic"
+                  }
+                ],
+                "scale_y": [
+                  {
+                    "frame": 0,
+                    "value": 1.0,
+                    "interpolation": "cubic"
+                  },
+                  {
+                    "frame": 30,
+                    "value": 1.0,
+                    "interpolation": "cubic"
+                  },
+                  {
+                    "frame": 60,
+                    "value": 1.0,
+                    "interpolation": "cubic"
+                  }
+                ]
+              },
+              "children": [],
+              "expanded": true
+            }
+          ],
+          "expanded": true
+        }
+      ],
+      "expanded": true
+    }
+  ]
+}

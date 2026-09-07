@@ -1,0 +1,39 @@
+name: build-windows
+
+# Builds the Windows portable .exe on an actual windows-latest runner
+# (PyInstaller can't cross-compile, so this is the reliable way to ship
+# a Windows build from a Linux/macOS dev machine).
+#
+# Trigger it manually from the Actions tab ("Run workflow"), or push a
+# tag like "v0.1" -- either way, download the .exe from the run's
+# "Artifacts" section afterward and hand it to your friends.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install UPX
+        run: choco install upx -y
+
+      - name: Build
+        run: python build.py --windows
+        shell: cmd
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AnimationStudio-windows
+          path: release/AnimationStudio.exe
+          if-no-files-found: error

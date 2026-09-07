@@ -1,0 +1,20 @@
+# build.py output
+/.build/
+/.buildvenv/
+/.tools/
+/release/
+
+# stray manual PyInstaller runs (pyinstaller main.py etc.)
+/dist/
+/build/
+/main.dist/
+/main.build/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS / editor cruft
+.DS_Store
