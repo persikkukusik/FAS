@@ -77,7 +77,12 @@ class StageWidget(QWidget):
         self._paint_canvas_transform = None
         self._pan_last_global = QPointF(0, 0)
 
-        self._start_obj_states: dict[str, tuple[QPointF, float, tuple[float, float]]] = {}
+        # Per selected object, the transform state captured when the drag
+        # started: (world position, local position, local rotation,
+        # (scale_x, scale_y)). The world position drives the drag itself; the
+        # LOCAL values are what undo/redo must round-trip, because world and
+        # local differ whenever an ancestor is transformed.
+        self._start_obj_states: dict[str, tuple[QPointF, QPointF, float, tuple[float, float]]] = {}
         self._avg_pivot = QPointF(0, 0)
 
         self.setFocusPolicy(Qt.StrongFocus)
@@ -984,8 +989,17 @@ class StageWidget(QWidget):
             if sprite is None:
                 continue
             img, local_rect = sprite
-            dest = self._world_transform(obj).mapRect(local_rect)
-            painter.drawImage(dest, img)
+            # Draw the sprite through the full local->world->viewport transform
+            # instead of mapRect(). The sprite's local rect must land under
+            # whatever rotation/scale the object's ANCESTORS apply, and
+            # mapRect() only returns an axis-aligned bounding box - wrong the
+            # moment any ancestor of a dragged object is rotated or scaled.
+            painter.save()
+            t = painter.worldTransform()
+            t *= self._world_transform(obj)
+            painter.setTransform(t)
+            painter.drawImage(local_rect, img)
+            painter.restore()
 
     def _end_live_drag(self):
         self._live_ids = set()
@@ -1942,7 +1956,7 @@ class StageWidget(QWidget):
             # sync it in place so the implicit save_selection() the emit below
             # triggers doesn't push an extra undo step (which would make the
             # deleted object only come back after *two* undos).
-            self.history.sync_selection(None)
+            self.history.sync_selection([])
             self.selection_changed.emit(None)
             self.update()
             for stage in self._all_stages():
@@ -2004,6 +2018,7 @@ class StageWidget(QWidget):
                 world = self._world_position(obj)
                 self._start_obj_states[obj.id] = (
                     world,
+                    QPointF(obj.transform.x, obj.transform.y),
                     obj.transform.rotation,
                     (obj.transform.scale_x, obj.transform.scale_y),
                 )
@@ -2114,7 +2129,7 @@ class StageWidget(QWidget):
                             avg_pivot.y() + dist * math.sin(new_angle_rad),
                         ),
                     )
-                    obj.transform.rotation = state[1] + delta
+                    obj.transform.rotation = state[2] + delta
 
         elif self.transform_mode == TransformMode.SCALE:
             cursor_canvas = QPointF(
@@ -2148,14 +2163,14 @@ class StageWidget(QWidget):
                     rel_x = obj_pos.x() - avg_pivot.x()
                     rel_y = obj_pos.y() - avg_pivot.y()
                     if self._constraint_axis == "x":
-                        obj.transform.scale_x = state[2][0] * ratio
-                        obj.transform.scale_y = state[2][1]
+                        obj.transform.scale_x = state[3][0] * ratio
+                        obj.transform.scale_y = state[3][1]
                     elif self._constraint_axis == "y":
-                        obj.transform.scale_x = state[2][0]
-                        obj.transform.scale_y = state[2][1] * ratio
+                        obj.transform.scale_x = state[3][0]
+                        obj.transform.scale_y = state[3][1] * ratio
                     else:
-                        obj.transform.scale_x = state[2][0] * ratio
-                        obj.transform.scale_y = state[2][1] * ratio
+                        obj.transform.scale_x = state[3][0] * ratio
+                        obj.transform.scale_y = state[3][1] * ratio
                     self._set_local_position(
                         obj,
                         QPointF(
@@ -2173,14 +2188,25 @@ class StageWidget(QWidget):
             if state is None:
                 continue
             obj_attrs: dict[str, tuple] = {}
-            if state[0].x() != obj.transform.x or state[0].y() != obj.transform.y:
-                obj_attrs["transform.x"] = (state[0].x(), obj.transform.x)
-                obj_attrs["transform.y"] = (state[0].y(), obj.transform.y)
-            if state[1] != obj.transform.rotation:
-                obj_attrs["transform.rotation"] = (state[1], obj.transform.rotation)
-            if state[2][0] != obj.transform.scale_x or state[2][1] != obj.transform.scale_y:
-                obj_attrs["transform.scale_x"] = (state[2][0], obj.transform.scale_x)
-                obj_attrs["transform.scale_y"] = (state[2][1], obj.transform.scale_y)
+            # Compare and record LOCAL values (state[1] is the local position
+            # at drag start). World-vs-local is different whenever an ancestor
+            # is transformed, so recording world coordinates as transform.x/y
+            # teleports a child object to its parent's origin on undo. Local
+            # values round-trip exactly, even when a child is dragged together
+            # with its moved/rotated ancestor (the child's local offset then
+            # simply doesn't change -> no entry, and undo restores the parent).
+            start_local = state[1]
+            if (
+                start_local.x() != obj.transform.x
+                or start_local.y() != obj.transform.y
+            ):
+                obj_attrs["transform.x"] = (start_local.x(), obj.transform.x)
+                obj_attrs["transform.y"] = (start_local.y(), obj.transform.y)
+            if state[2] != obj.transform.rotation:
+                obj_attrs["transform.rotation"] = (state[2], obj.transform.rotation)
+            if state[3][0] != obj.transform.scale_x or state[3][1] != obj.transform.scale_y:
+                obj_attrs["transform.scale_x"] = (state[3][0], obj.transform.scale_x)
+                obj_attrs["transform.scale_y"] = (state[3][1], obj.transform.scale_y)
             if obj_attrs:
                 changes[obj.id] = obj_attrs
         if changes:
@@ -2200,11 +2226,15 @@ class StageWidget(QWidget):
         for obj in selected:
             state = self._start_obj_states.get(obj.id)
             if state:
-                obj.transform.x = state[0].x()
-                obj.transform.y = state[0].y()
-                obj.transform.rotation = state[1]
-                obj.transform.scale_x = state[2][0]
-                obj.transform.scale_y = state[2][1]
+                # Restore the exact local values captured at drag start.
+                # state[0] is the WORLD position at drag start; writing world
+                # coordinates into transform.x/y would teleport a child of a
+                # transformed ancestor to its parent's origin.
+                obj.transform.x = state[1].x()
+                obj.transform.y = state[1].y()
+                obj.transform.rotation = state[2]
+                obj.transform.scale_x = state[3][0]
+                obj.transform.scale_y = state[3][1]
         self.transform_mode = TransformMode.NONE
         self._constraint_axis = None
         self._end_live_drag()
