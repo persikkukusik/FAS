@@ -22,7 +22,6 @@ from PySide6.QtGui import (
     QPainterPath,
     QTransform,
     QImage,
-    QCursor,
     QGuiApplication,
 )
 from PySide6.QtWidgets import QWidget, QApplication
@@ -35,6 +34,7 @@ from core.history import History
 from ui.theme import Theme
 from ui.stripes import StripeShader
 from ui.menus import stripe_menu_open
+from ui.relative_drag import RelativeDrag
 
 
 class TransformMode(Enum):
@@ -42,6 +42,11 @@ class TransformMode(Enum):
     MOVE = auto()
     ROTATE = auto()
     SCALE = auto()
+    PIVOT = auto()
+
+
+# Click tolerance (screen px) for grabbing the pivot marker with the mouse.
+_PIVOT_HIT_PX = 8.0
 
 
 class StageWidget(QWidget):
@@ -71,8 +76,21 @@ class StageWidget(QWidget):
         self._constraint_axis: str | None = None
         self._transform_delta = QPointF(0, 0)
         self._last_global = None
-        self._just_wrapped = False
         self._panning = False
+
+        # Relative-motion ("fake cursor") dragging is handled by the shared
+        # RelativeDrag controller (see ui/relative_drag.py), which hides the
+        # real OS cursor, snaps it back to a fixed anchor so it can never steal
+        # focus, and drives a tiled visual cursor from raw deltas. The
+        # attributes below are thin compatibility views onto the controller so
+        # callers and tests keep working unchanged.
+        self._drag = RelativeDrag(self)
+        self._drag_anchor_global = QPoint()
+        self._fake_cursor_pos = QPointF(0, 0)
+        self._fake_cursor_kind: str | None = None  # None | "cross" | "hand"
+        self._drag_priming = False
+        self._drag_began_monotonic = 0.0
+        self._DRAG_GRACE_MS = 16
 
         self._paint_canvas_transform = None
         self._pan_last_global = QPointF(0, 0)
@@ -84,6 +102,10 @@ class StageWidget(QWidget):
         # local differ whenever an ancestor is transformed.
         self._start_obj_states: dict[str, tuple[QPointF, QPointF, float, tuple[float, float]]] = {}
         self._avg_pivot = QPointF(0, 0)
+        # The single selected object whose origin/pivot dot is being dragged.
+        # The pivot IS the origin, so this is the object a PIVOT transform
+        # relocates - and only this one, never the whole selection.
+        self._pivot_drag_obj: SceneObject | None = None
 
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMinimumSize(300, 300)
@@ -232,8 +254,16 @@ class StageWidget(QWidget):
         This is the trigger for hover highlighting on the canvas itself
         (as opposed to e.g. a layers panel setting ``hovered_object``
         directly). Starts/stops the hover animation timer as needed.
+
+        An origin/pivot dot swallows the hover just like it swallows the
+        click: hovering one of a selected object's dots highlights NOTHING
+        beneath it, so a background object can never light up "through" a
+        dot even when it is painted on top of the dot's owner.
         """
-        obj = self.hit_test(canvas_pos)
+        if self._hit_test_pivot(canvas_pos) is not None:
+            obj = None
+        else:
+            obj = self.hit_test(canvas_pos)
         if obj is self.hovered_object and self._hover_from_canvas:
             return
         self._hover_from_canvas = True
@@ -366,7 +396,18 @@ class StageWidget(QWidget):
             self._draw_transform_gizmo(painter)
 
         painter.restore()
+
+        if self._fake_cursor_kind is not None:
+            self._draw_fake_cursor(painter)
+
         painter.end()
+
+    def _draw_fake_cursor(self, painter: QPainter) -> None:
+        """Draw the visual stand-in for the real (hidden) cursor, delegating
+        to the shared RelativeDrag controller (tiled wrapping rendering)."""
+        self._drag.kind = self._fake_cursor_kind
+        self._drag._fake_pos = self._fake_cursor_pos
+        self._drag.paint(painter)
 
     def _render_canvas_body(self, img_w: int, img_h: int, dpr: float) -> QImage:
         """Rasterises only the visible window portion directly at 1:1 screen DPI."""
@@ -519,10 +560,13 @@ class StageWidget(QWidget):
 
     def _paint_own_shape(self, painter: QPainter, obj: SceneObject) -> None:
         """Draw `obj`'s own visible shape (containers draw nothing) at the
-        painter's current origin, with no opacity applied by itself."""
+        painter's current origin, with no opacity applied by itself. The
+        shape sits at the object's content offset from its origin."""
         painter.setPen(Qt.NoPen)
         painter.setBrush(self._flat_brush(obj))
 
+        painter.save()
+        painter.translate(obj.transform.content_x, obj.transform.content_y)
         if obj.shape_type == "rect":
             w = obj.shape_data.get("width", 100)
             h = obj.shape_data.get("height", 80)
@@ -533,6 +577,7 @@ class StageWidget(QWidget):
         elif obj.shape_type == "polygon":
             if obj.shape_data.get("points"):
                 painter.drawPath(self._local_path(obj))
+        painter.restore()
 
     def _draw_grouped(
         self,
@@ -835,6 +880,23 @@ class StageWidget(QWidget):
                 return True
         return False
 
+    def _paint_order(self) -> list:
+        """DFS pre-order list of the scene's objects in the exact order the
+        canvas body paints them (visible subtrees only). Earlier = lower z,
+        drawn first and therefore covered by anything painted after it."""
+        order: list = []
+
+        def visit(obj) -> None:
+            if not obj.visible:
+                return
+            order.append(obj)
+            for child in obj.children:
+                visit(child)
+
+        for obj in self.scene.objects:
+            visit(obj)
+        return order
+
     def _subtree_content_fp(self, obj: SceneObject):
         """Fingerprint of everything that shapes ``obj``'s subtree render,
         in ``obj``'s OWN local coordinate space: visibility, mask-ness, the
@@ -842,13 +904,20 @@ class StageWidget(QWidget):
         own transform is deliberately excluded - the local-space caches
         (union, bbox, sprite) are independent of it and it is re-applied
         cheaply at use time, so a plain MOVE drag leaves this fingerprint
-        untouched and those caches stay valid for the whole drag."""
+        untouched and those caches stay valid for the whole drag.
+
+        The content offset (content_x/content_y) is NOT excluded, even on the
+        root: it permanently shifts the geometry inside local space (a pivot
+        drag re-bases an object's contents against the origin), so the cached
+        unions/bboxes/sprites must invalidate when it changes."""
         items: list = []
         def walk(o: SceneObject, root: bool) -> None:
             items.append(id(o))
             items.append(1 if o.visible else 0)
             items.append(o.is_mask)
             items.append(o.mask_mode)
+            items.append(o.transform.content_x)
+            items.append(o.transform.content_y)
             if not root:
                 t = o.transform
                 items.append(t.x)
@@ -925,6 +994,8 @@ class StageWidget(QWidget):
         the translate/rotate/scale of ``obj`` itself."""
         painter.setPen(Qt.NoPen)
         painter.setBrush(self._flat_brush(obj))
+        painter.save()
+        painter.translate(obj.transform.content_x, obj.transform.content_y)
         if obj.shape_type == "rect":
             w = obj.shape_data.get("width", 100)
             h = obj.shape_data.get("height", 80)
@@ -935,6 +1006,7 @@ class StageWidget(QWidget):
         elif obj.shape_type == "polygon":
             if obj.shape_data.get("points"):
                 painter.drawPath(self._local_path(obj))
+        painter.restore()
         for child in obj.children:
             if child.visible:
                 self._draw_subtree(painter, child, {}, {})
@@ -976,13 +1048,15 @@ class StageWidget(QWidget):
 
     def _draw_live_overlays(self, painter: QPainter):
         """Blit the cached sprites of objects currently being moved. Enabled
-        only for axis-aligned, un-scaled objects in a MOVE drag with no masks
-        in the scene; otherwise falls back to the full-snapshot reraster."""
+        only for z-safe, axis-aligned, un-scaled objects in a MOVE drag with
+        no masks in the scene; otherwise falls back to the full-snapshot
+        reraster. Sprites are drawn in paint order (ancestor subtrees first)
+        so that a live object never covers a higher-z sibling."""
         if self.transform_mode != TransformMode.MOVE:
             return
         if not self._live_ids:
             return
-        for obj in SelectionState.selected():
+        for obj in self._paint_order():
             if obj.id not in self._live_ids:
                 continue
             sprite = self._sprite_for(obj)
@@ -995,8 +1069,11 @@ class StageWidget(QWidget):
             # mapRect() only returns an axis-aligned bounding box - wrong the
             # moment any ancestor of a dragged object is rotated or scaled.
             painter.save()
-            t = painter.worldTransform()
-            t *= self._world_transform(obj)
+            # Qt composes transforms as p' = p * M, so the object's OWN
+            # transform must be composed BEFORE the current canvas->widget
+            # viewport transform: local -> world -> viewport.
+            t = QTransform(self._world_transform(obj))
+            t *= painter.worldTransform()
             painter.setTransform(t)
             painter.drawImage(local_rect, img)
             painter.restore()
@@ -1007,16 +1084,20 @@ class StageWidget(QWidget):
 
     def _get_local_shape(self, obj: SceneObject, include_children: bool = True) -> QPainterPath:
         local = QPainterPath()
+        cx = obj.transform.content_x
+        cy = obj.transform.content_y
         if obj.shape_type == "rect":
             w = obj.shape_data.get("width", 100)
             h = obj.shape_data.get("height", 80)
-            local.addRect(-w / 2, -h / 2, w, h)
+            local.addRect(-w / 2 + cx, -h / 2 + cy, w, h)
         elif obj.shape_type == "circle":
             r = obj.shape_data.get("radius", 50)
-            local.addEllipse(QPointF(0, 0), r, r)
+            local.addEllipse(QPointF(cx, cy), r, r)
         elif obj.shape_type == "polygon":
             if obj.shape_data.get("points"):
-                local.addPath(self._local_path(obj))
+                t = QTransform()
+                t.translate(cx, cy)
+                local.addPath(t.map(self._local_path(obj)))
         # Containers (Symbols) contribute no geometry of their own; only their
         # children (shapes and nested containers) shape the union below.
         if include_children:
@@ -1068,6 +1149,52 @@ class StageWidget(QWidget):
             local = inv.map(world_pos)
             obj.transform.x = local.x()
             obj.transform.y = local.y()
+
+    def _content_compensation(self, host: SceneObject, world_delta: QPointF) -> QPointF:
+        """The local-space shift that keeps ``host``'s content pinned to the
+        same world position when something above it is translated by
+        ``world_delta`` (negated, so adding it cancels the move's effect).
+
+        ``host``'s content is mapped by the linear (rotate/scale) part of
+        ``host``'s world transform - translation cancels out for deltas, so
+        only that linear part needs inverting.
+
+        Used by the pivot drag: dragging an object's origin relocates the
+        (0,0) reference frame while its contents stay in world space, so
+        contents re-position relative to the new origin.
+        """
+        t = self._world_transform(host)
+        linear = QTransform(t.m11(), t.m12(), t.m21(), t.m22(), 0.0, 0.0)
+        inv, ok = linear.inverted()
+        if not ok or linear.determinant() == 0.0:
+            return QPointF(0, 0)
+        p = inv.map(QPointF(world_delta.x(), world_delta.y()))
+        return QPointF(-p.x(), -p.y())
+
+    def _hit_test_pivot(self, canvas_pos: QPointF) -> SceneObject | None:
+        """The selected object (if any) whose origin/pivot dot is under
+        ``canvas_pos`` (within grab range).
+
+        The pivot point IS the object's origin - the dot at its world origin,
+        the (0,0) reference for its own paths and children. Only SELECTED
+        objects show and expose their pivot dot; a shared marker is NOT used.
+
+        The dot's hitbox outranks every ordinary shape hitbox - even those of
+        objects painted on top of the dot's owner - so both clicks AND hover
+        treat a dot hit as the dot's, never as the object beneath it.
+        """
+        tol = _PIVOT_HIT_PX / self.zoom if self.zoom > 0 else _PIVOT_HIT_PX
+        best: SceneObject | None = None
+        best_dist = tol
+        for obj in SelectionState.selected():
+            world = self._world_position(obj)
+            dist = math.hypot(
+                canvas_pos.x() - world.x(), canvas_pos.y() - world.y()
+            )
+            if dist <= best_dist:
+                best_dist = dist
+                best = obj
+        return best
 
     def _transform_point_to_local(self, point: QPointF, transform) -> QPointF:
         """Apply the inverse of a single Transform to a point (world -> local)."""
@@ -1711,8 +1838,8 @@ class StageWidget(QWidget):
     def _local_point_in_object(self, local: QPointF, obj: SceneObject) -> bool:
         """Test a point already expressed in `obj`'s local space against the
         object's own geometry (its scene-children are handled by the caller)."""
-        lx = local.x()
-        ly = local.y()
+        lx = local.x() - obj.transform.content_x
+        ly = local.y() - obj.transform.content_y
 
         if obj.shape_type == "rect":
             w = obj.shape_data.get("width", 100)
@@ -1725,78 +1852,64 @@ class StageWidget(QWidget):
             points = obj.shape_data.get("points", [])
             if not points:
                 return False
-            return self._local_path(obj).contains(local)
+            return self._local_path(obj).contains(QPointF(lx, ly))
         # Containers (Symbols) have no own geometry, so they are never hit on
         # the stage directly - only the shapes they contain are. Select a
         # container from the outliner to move the whole group.
         return False
 
-    def focusOutEvent(self, event):
-        # Do NOT cancel transform on simple focus changes caused by mouse grabbing/warping.
-        # Only cancel if explicit focus policy requires it, or handle cleanly.
-        if self.transform_mode != TransformMode.NONE and not self.underMouse():
-            # Keep transform intact unless deliberately destroyed
-            pass
-        super().focusOutEvent(event)
+    def _relative_drag_delta(self, current_global_pos: QPoint) -> tuple[float, float]:
+        """Feed a move event's global position through the shared RelativeDrag
+        controller and return the relative CANVAS-space delta (raw pixels
+        divided by zoom). Returns (0, 0) for untrusted/stale events so the
+        caller does nothing that frame.
 
-    def _wrap_mouse(self, current_global_pos: QPoint) -> tuple[float, float]:
-        if self._last_global is None:
-            self._last_global = current_global_pos
+        The controller measures raw hardware delta against a FIXED anchor (the
+        dock centre), discarding every event during the post-warp grace window
+        so a run of stale/queued pre-warp events can't register as a spurious
+        jump (the old "snap to a random offset" glitch), then snaps the hidden
+        real cursor back to the anchor so it can never steal focus.
+        """
+        delta = self._drag.delta(current_global_pos)
+        self._sync_drag_compat()
+        if delta is None:
             return 0.0, 0.0
-
-        # Calculate raw screen pixel movement
-        raw_dx = float(current_global_pos.x() - self._last_global.x())
-        raw_dy = float(current_global_pos.y() - self._last_global.y())
-
-        screen = QGuiApplication.screenAt(current_global_pos) or QGuiApplication.primaryScreen()
-        rect = screen.geometry()
-
-        left, top = rect.left(), rect.top()
-        right, bottom = rect.right() - 1, rect.bottom() - 1
-
-        target_x = current_global_pos.x()
-        target_y = current_global_pos.y()
-        wrapped = False
-
-        margin = 10
-        if current_global_pos.x() <= left:
-            target_x = right - margin
-            wrapped = True
-        elif current_global_pos.x() >= right:
-            target_x = left + margin
-            wrapped = True
-
-        if current_global_pos.y() <= top:
-            target_y = bottom - margin
-            wrapped = True
-        elif current_global_pos.y() >= bottom:
-            target_y = top + margin
-            wrapped = True
-
-        if wrapped:
-            new_pos = QPoint(int(target_x), int(target_y))
-            # NEVER call releaseMouse() here - keep the grab active!
-            QCursor.setPos(new_pos)
-            self._last_global = new_pos
-        else:
-            self._last_global = current_global_pos
-
-        # Divide by zoom scale so movement speed is invariant to view scale
+        raw_dx, raw_dy = delta
         zoom_level = getattr(self, "zoom", 1.0)
         if zoom_level <= 0:
             zoom_level = 1.0
+        return raw_dx / zoom_level, raw_dy / zoom_level
 
-        canvas_dx = raw_dx / zoom_level
-        canvas_dy = raw_dy / zoom_level
+    def _begin_relative_drag(self, kind: str) -> None:
+        """Start hidden-cursor relative dragging (transform or pan): delegate
+        to the shared controller, which primes the visual fake cursor at the
+        real cursor's position, hides the real cursor, and anchors it."""
+        self._drag.begin(kind)
+        self._sync_drag_compat()
 
-        return canvas_dx, canvas_dy
+    def _end_relative_drag(self) -> None:
+        """Stop relative dragging: the controller restores the now-visible
+        real cursor to where the fake cursor was (no visible jump) and drops
+        the fake glyph."""
+        self._drag.end()
+        self._sync_drag_compat()
+
+    def _sync_drag_compat(self) -> None:
+        """Mirror the shared controller's private state back onto StageWidget's
+        compatibility view attributes (kept for callers/tests)."""
+        drag = self._drag
+        self._drag_anchor_global = getattr(drag, "_gesture_global", QPoint())
+        self._fake_cursor_pos = drag._fake_pos
+        self._fake_cursor_kind = drag.kind
+        self._drag_priming = getattr(drag, "_priming", False)
+        self._drag_began_monotonic = getattr(drag, "_began_monotonic", 0.0)
 
     def mouseMoveEvent(self, event):
         global_pos = event.globalPosition().toPoint()
         is_transforming = getattr(self, "transform_mode", TransformMode.NONE) != TransformMode.NONE
 
         if is_transforming or getattr(self, "_panning", False):
-            dx, dy = self._wrap_mouse(global_pos)
+            dx, dy = self._relative_drag_delta(global_pos)
 
             if dx == 0 and dy == 0:
                 event.accept()
@@ -1804,11 +1917,14 @@ class StageWidget(QWidget):
 
             if getattr(self, "_panning", False):
                 self._pan += QPointF(dx * getattr(self, "zoom", 1.0), dy * getattr(self, "zoom", 1.0))
+                # Panning only shifts the cached snapshot by a scroll offset
+                # (plus the fake-cursor glyph), so a synchronous repaint is
+                # cheap and keeps it from trailing the mouse.
+                self.repaint()
             else:
                 self._transform_delta += QPointF(dx, dy)
-                self._update_transform()
+                self._update_transform()  # repaints immediately itself
 
-            self.update()
             event.accept()
             return
 
@@ -1825,8 +1941,7 @@ class StageWidget(QWidget):
         # Middle-Click / Shift+Middle-Click Pan
         if event.button() == Qt.MiddleButton:
             self._panning = True
-            self._last_global = global_pos
-            self.setCursor(Qt.ClosedHandCursor)
+            self._begin_relative_drag("hand")
             self.grabMouse()
             event.accept()
             return
@@ -1844,6 +1959,19 @@ class StageWidget(QWidget):
             # Selection handling
             canvas_pos = self.viewport_to_canvas(event.position())
             additive = bool(event.modifiers() & Qt.ShiftModifier)
+
+            # Grabbing any selected object's origin/pivot dot drags that
+            # object's origin (pivot == origin, and only that object's -
+            # other selected objects keep their own dots and positions).
+            if not additive:
+                target = self._hit_test_pivot(canvas_pos)
+                if target is not None:
+                    self._pivot_drag_obj = target
+                    self._last_global = global_pos
+                    self._start_transform(TransformMode.PIVOT)
+                    event.accept()
+                    return
+
             if hasattr(self, "hit_test") and hasattr(self, "_update_selection"):
                 obj = self.hit_test(canvas_pos)
                 self._update_selection(obj, additive=additive)
@@ -1854,12 +1982,24 @@ class StageWidget(QWidget):
             return
 
         super().mousePressEvent(event)
+
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MiddleButton and getattr(self, "_panning", False):
             self._panning = False
-            self._last_global = None
+            self._end_relative_drag()
             self.releaseMouse()
-            self.setCursor(Qt.ArrowCursor)
+            event.accept()
+            return
+
+        # The pivot is a press-and-hold drag: it begins on LMB press on the
+        # pivot marker, so releasing LMB applies it. Unlike the keyboard
+        # G/R/S transforms (started away from the mouse), no second click
+        # should be needed to commit.
+        if (
+            event.button() == Qt.LeftButton
+            and getattr(self, "transform_mode", TransformMode.NONE) == TransformMode.PIVOT
+        ):
+            self._confirm_transform()
             event.accept()
             return
 
@@ -1983,10 +2123,15 @@ class StageWidget(QWidget):
 
     def focusOutEvent(self, event):
         # Losing focus mid-transform (e.g. alt-tabbing away) would otherwise
-        # leave the mouse grab held indefinitely, since neither
-        # _confirm_transform nor _cancel_transform would run to release it.
+        # leave the mouse grab (and the hidden/anchored cursor) held
+        # indefinitely, since neither _confirm_transform nor
+        # _cancel_transform would run to release it.
         if self.transform_mode != TransformMode.NONE:
             self._cancel_transform()
+        elif getattr(self, "_panning", False):
+            self._panning = False
+            self._end_relative_drag()
+            self.releaseMouse()
         super().focusOutEvent(event)
 
     def _update_status_for_constraint(self):
@@ -1994,6 +2139,7 @@ class StageWidget(QWidget):
             TransformMode.MOVE: "Move",
             TransformMode.ROTATE: "Rotate",
             TransformMode.SCALE: "Scale",
+            TransformMode.PIVOT: "Pivot",
         }
         name = names.get(self.transform_mode, "")
         axis = self._constraint_axis.upper() if self._constraint_axis else ""
@@ -2004,14 +2150,19 @@ class StageWidget(QWidget):
         self.transform_mode = mode
         self.transform_started.emit()
         g = self.cursor().pos()
-        self._last_global = QPointF(g.x(), g.y())
-        self._just_wrapped = False
-        self._transform_delta = QPointF(0, 0)
+        # Capture the click-space starting point BEFORE _begin_relative_drag
+        # moves the real cursor to the anchor - this is what the gizmo math
+        # (and the constraint-axis picking) is measured from, not the
+        # anchor itself.
         self._start_mouse = self.viewport_to_canvas(
             self.mapFromGlobal(g)
         )
+        self._transform_delta = QPointF(0, 0)
+        if mode != TransformMode.PIVOT:
+            self._pivot_drag_obj = None
         selected = SelectionState.selected()
         self._start_obj_states = {}
+        self._start_content_offsets: dict[str, tuple[float, float]] = {}
         self._avg_pivot = QPointF(0, 0)
         if selected:
             for obj in selected:
@@ -2022,40 +2173,74 @@ class StageWidget(QWidget):
                     obj.transform.rotation,
                     (obj.transform.scale_x, obj.transform.scale_y),
                 )
+                # The rotate/scale pivot is the average of each selected
+                # object's own origin (= its pivot), not a shared point.
                 self._avg_pivot += world
             self._avg_pivot /= len(selected)
+        if mode == TransformMode.PIVOT and self._pivot_drag_obj is not None:
+            # Dragging an origin moves the reference frame while the object's
+            # whole subtree stays put in WORLD space: every descendant's local
+            # position, and the grabbed object's own content offset, must be
+            # re-based against the new origin. Capture them all at drag start
+            # so the compensation can never compound across frames.
+            grabbed = self._pivot_drag_obj
+            self._start_content_offsets[grabbed.id] = (
+                grabbed.transform.content_x,
+                grabbed.transform.content_y,
+            )
+            for o in grabbed.iter_subtree():
+                if o.id in self._start_obj_states:
+                    continue
+                self._start_obj_states[o.id] = (
+                    self._world_position(o),
+                    QPointF(o.transform.x, o.transform.y),
+                    o.transform.rotation,
+                    (o.transform.scale_x, o.transform.scale_y),
+                )
         self._start_pos = self._avg_pivot
         self._start_rotation = 0.0
         self._start_scale = (1.0, 1.0)
         self._constraint_axis = None
-        self.setCursor(Qt.CrossCursor)
+        self._begin_relative_drag("cross")
 
-        # Grab the mouse for the duration of the transform so this widget
-        # keeps receiving mouseMoveEvents even if a fast flick sends the
-        # cursor clean off the widget (or off-screen) between native events.
-        # Without this, a large single delta can jump past the wrap margin
-        # entirely - the widget simply stops getting move events until the
-        # cursor wanders back over it, so `_check_cursor_wrap` never runs and
-        # the "wrap" is missed. Every code path that ends a transform must
-        # release this grab (see _confirm_transform, _cancel_transform, and
-        # focusOutEvent as a safety net).
+        # Grab the mouse for the duration of the transform. This is now
+        # mostly a safety net rather than load-bearing: since the real
+        # cursor is hidden and continuously snapped back to a fixed anchor
+        # near the dock's center (see _begin_relative_drag /
+        # _relative_drag_delta), it never travels far enough to actually
+        # leave the widget in normal use. Every code path that ends a
+        # transform must release this grab (see _confirm_transform,
+        # _cancel_transform, and focusOutEvent as a safety net).
         self.grabMouse()
 
         self._end_live_drag()
-        if mode == TransformMode.MOVE and not self._any_masks():
-            # Axis-aligned + un-scaled objects can be redrawn as a cached
-            # sprite during the drag (blit-only per move); anything rotated or
-            # scaled falls back to the full-snapshot reraster each move.
-            self._live_ids = {
-                obj.id
-                for obj in selected
-                if (
-                    not obj.is_mask
-                    and obj.transform.rotation == 0
-                    and obj.transform.scale_x == 1.0
-                    and obj.transform.scale_y == 1.0
-                )
-            }
+        if mode == TransformMode.MOVE and not self._any_masks() and selected:
+            # Only Z-SAFE objects can be redrawn as a cached sprite during the
+            # drag (blit-only per move). The sprite is blitted ON TOP of the
+            # snapshot, so a live object must never be occludable: nothing
+            # rendered after it may ever cover it. That is exactly the case
+            # when every selected object sits on the root chain ending at the
+            # LAST-painted object of the scene - nothing outside their subtree
+            # is painted later, so they can never be buried no matter where the
+            # drag moves them. Anything buried (or rotated/scaled) falls back
+            # to the full-snapshot reraster each move, which keeps the correct
+            # z-order.
+            order = self._paint_order()
+            if order:
+                chain = set()
+                node = order[-1]
+                while node is not None:
+                    chain.add(id(node))
+                    node = self.scene.find_parent(node)
+                if all(
+                    not o.is_mask
+                    and o.transform.rotation == 0
+                    and o.transform.scale_x == 1.0
+                    and o.transform.scale_y == 1.0
+                    and id(o) in chain
+                    for o in selected
+                ):
+                    self._live_ids = {o.id for o in selected}
         # Whatever path we take, the snapshot must be rebuilt on the first
         # paint after a transform starts/ends: live sprites must be baked out
         # of (or back into) it.
@@ -2065,6 +2250,7 @@ class StageWidget(QWidget):
             TransformMode.MOVE: "Move",
             TransformMode.ROTATE: "Rotate",
             TransformMode.SCALE: "Scale",
+            TransformMode.PIVOT: "Pivot",
         }
         count_label = f" ({len(selected)} objs)" if len(selected) > 1 else ""
         self.status_message.emit(
@@ -2179,13 +2365,71 @@ class StageWidget(QWidget):
                         ),
                     )
 
-        self.update()
+        elif self.transform_mode == TransformMode.PIVOT:
+            # Dragging an object's pivot/origin dot relocates that object's
+            # ORIGIN - its (0,0) reference frame. The object's CONTENT (its
+            # own shape and every descendant) stays put in WORLD space: each
+            # piece re-positions relative to the new origin so its world
+            # position is unchanged. Only the grabbed object's subtree is
+            # touched; the other selected objects keep their own individual
+            # pivots/origins.
+            obj = self._pivot_drag_obj
+            state = self._start_obj_states.get(obj.id) if obj is not None else None
+            if state is not None:
+                dx = self._transform_delta.x()
+                dy = self._transform_delta.y()
+                if self._constraint_axis == "x":
+                    dy = 0.0
+                elif self._constraint_axis == "y":
+                    dx = 0.0
+                # The delta is TOTAL from drag start, so the target is placed
+                # from its START origin - never re-accumulated from the
+                # already-moved current position (that would run away).
+                delta = QPointF(dx, dy)
+                self._set_local_position(
+                    obj, QPointF(state[0].x() + dx, state[0].y() + dy)
+                )
+                # Contents keep their world positions: compensate this origin
+                # move in each piece's own local axes (rotation/scale-safe).
+                start_content = self._start_content_offsets.get(obj.id)
+                if start_content is not None:
+                    comp = self._content_compensation(obj, delta)
+                    obj.transform.content_x = start_content[0] + comp.x()
+                    obj.transform.content_y = start_content[1] + comp.y()
+                for descendant in obj.iter_subtree():
+                    if descendant is obj:
+                        continue
+                    desc_state = self._start_obj_states.get(descendant.id)
+                    if desc_state is None:
+                        continue
+                    parent = self.scene.find_parent(descendant)
+                    if parent is None:
+                        continue
+                    comp = self._content_compensation(parent, delta)
+                    descendant.transform.x = desc_state[1].x() + comp.x()
+                    descendant.transform.y = desc_state[1].y() + comp.y()
+                self._avg_pivot = self._world_position(obj)
+
+        # Repaint IMMEDIATELY rather than scheduling it. During the cheap
+        # live-sprite MOVE path each move only blits a cached sprite, so a
+        # synchronous `repaint()` is nearly free and, crucially, renders the
+        # new transform in the SAME event-handling pass that computed it -
+        # eliminating the one-frame lag where the object and fake cursor
+        # trail the mouse. The expensive paths (no live sprite: rotate, scale,
+        # masks, buried objects) fall back to the asynchronous `update()`, which
+        # coalesces into a single repaint per event-loop cycle and avoids
+        # blocking on a costly full reraster.
+        move_cheap = (self.transform_mode == TransformMode.MOVE) and bool(self._live_ids)
+        if move_cheap:
+            self.repaint()
+        else:
+            self.update()
 
     def _confirm_transform(self):
         changes: dict[str | None, dict[str, tuple]] = {}
-        for obj in SelectionState.selected():
-            state = self._start_obj_states.get(obj.id)
-            if state is None:
+        for obj_id, state in self._start_obj_states.items():
+            obj = self.scene.get_object_by_id(obj_id)
+            if obj is None:
                 continue
             obj_attrs: dict[str, tuple] = {}
             # Compare and record LOCAL values (state[1] is the local position
@@ -2207,39 +2451,57 @@ class StageWidget(QWidget):
             if state[3][0] != obj.transform.scale_x or state[3][1] != obj.transform.scale_y:
                 obj_attrs["transform.scale_x"] = (state[3][0], obj.transform.scale_x)
                 obj_attrs["transform.scale_y"] = (state[3][1], obj.transform.scale_y)
+            start_content = self._start_content_offsets.get(obj_id)
+            if start_content is not None and (
+                start_content[0] != obj.transform.content_x
+                or start_content[1] != obj.transform.content_y
+            ):
+                obj_attrs["transform.content_x"] = (
+                    start_content[0],
+                    obj.transform.content_x,
+                )
+                obj_attrs["transform.content_y"] = (
+                    start_content[1],
+                    obj.transform.content_y,
+                )
             if obj_attrs:
-                changes[obj.id] = obj_attrs
+                changes[obj_id] = obj_attrs
         if changes:
             self.history.push(PropertyCommand(changes))
         self.transform_mode = TransformMode.NONE
         self._constraint_axis = None
         self._end_live_drag()
         self.releaseMouse()
-        self.setCursor(Qt.ArrowCursor)
+        self._end_relative_drag()
         self.setFocus()
         self.status_message.emit("Ready")
         self.transform_ended.emit()
         self.update()
 
     def _cancel_transform(self):
-        selected = SelectionState.selected()
-        for obj in selected:
-            state = self._start_obj_states.get(obj.id)
-            if state:
-                # Restore the exact local values captured at drag start.
-                # state[0] is the WORLD position at drag start; writing world
-                # coordinates into transform.x/y would teleport a child of a
-                # transformed ancestor to its parent's origin.
-                obj.transform.x = state[1].x()
-                obj.transform.y = state[1].y()
-                obj.transform.rotation = state[2]
-                obj.transform.scale_x = state[3][0]
-                obj.transform.scale_y = state[3][1]
+        for obj_id, state in self._start_obj_states.items():
+            obj = self.scene.get_object_by_id(obj_id)
+            if not obj:
+                continue
+            # Restore the exact local values captured at drag start.
+            # state[0] is the WORLD position at drag start; writing world
+            # coordinates into transform.x/y would teleport a child of a
+            # transformed ancestor to its parent's origin.
+            obj.transform.x = state[1].x()
+            obj.transform.y = state[1].y()
+            obj.transform.rotation = state[2]
+            obj.transform.scale_x = state[3][0]
+            obj.transform.scale_y = state[3][1]
+        for obj_id, (cx, cy) in self._start_content_offsets.items():
+            obj = self.scene.get_object_by_id(obj_id)
+            if obj:
+                obj.transform.content_x = cx
+                obj.transform.content_y = cy
         self.transform_mode = TransformMode.NONE
         self._constraint_axis = None
         self._end_live_drag()
         self.releaseMouse()
-        self.setCursor(Qt.ArrowCursor)
+        self._end_relative_drag()
         self.setFocus()
         self.status_message.emit("Ready")
         self.transform_ended.emit()
@@ -2297,38 +2559,3 @@ class StageWidget(QWidget):
             state = "OFF"
         self.status_message.emit(f"Mask {state} on {obj.name}")
         self.update()
-
-    def _check_cursor_wrap(self):
-        if self.transform_mode == TransformMode.NONE:
-            return
-        from PySide6.QtGui import QCursor
-
-        local = self.mapFromGlobal(self.cursor().pos())
-        # Widened from 10px: with grabMouse() held during the whole transform
-        # we now reliably get every move event even when the cursor lands
-        # off-widget, but a slightly bigger margin still gives a large single
-        # delta (very fast flick / high-polling-rate mouse) more room to
-        # register as "reached the edge" rather than skating past it.
-        margin = 20
-        new_local = QPoint(local)
-        did_wrap = False
-
-        if local.x() <= margin:
-            new_local.setX(self.width() - margin)
-            did_wrap = True
-        elif local.x() >= self.width() - margin:
-            new_local.setX(margin)
-            did_wrap = True
-
-        if local.y() <= margin:
-            new_local.setY(self.height() - margin)
-            did_wrap = True
-        elif local.y() >= self.height() - margin:
-            new_local.setY(margin)
-            did_wrap = True
-
-        if did_wrap:
-            QCursor.setPos(self.mapToGlobal(new_local))
-            g = QCursor.pos()
-            self._last_global = QPointF(g.x(), g.y())
-            self._just_wrapped = True
