@@ -101,16 +101,20 @@ def _flat_brush(obj):
 
 def _get_local_shape(obj, include_children=True) -> QPainterPath:
     local = QPainterPath()
+    cx = obj.transform.content_x
+    cy = obj.transform.content_y
     if obj.shape_type == "rect":
         w = obj.shape_data.get("width", 100)
         h = obj.shape_data.get("height", 80)
-        local.addRect(-w / 2, -h / 2, w, h)
+        local.addRect(-w / 2 + cx, -h / 2 + cy, w, h)
     elif obj.shape_type == "circle":
         r = obj.shape_data.get("radius", 50)
-        local.addEllipse(QPointF(0, 0), r, r)
+        local.addEllipse(QPointF(cx, cy), r, r)
     elif obj.shape_type == "polygon":
         if obj.shape_data.get("points"):
-            local.addPath(_local_path(obj))
+            t = QTransform()
+            t.translate(cx, cy)
+            local.addPath(t.map(_local_path(obj)))
     if include_children:
         for child in obj.children:
             t = QTransform()
@@ -153,6 +157,8 @@ def _world_transform(scene: Scene, obj) -> QTransform:
 def _paint_own_shape(painter: QPainter, obj) -> None:
     painter.setPen(Qt.NoPen)
     painter.setBrush(_flat_brush(obj))
+    painter.save()
+    painter.translate(obj.transform.content_x, obj.transform.content_y)
     if obj.shape_type == "rect":
         w = obj.shape_data.get("width", 100)
         h = obj.shape_data.get("height", 80)
@@ -163,6 +169,7 @@ def _paint_own_shape(painter: QPainter, obj) -> None:
     elif obj.shape_type == "polygon":
         if obj.shape_data.get("points"):
             painter.drawPath(_local_path(obj))
+    painter.restore()
 
 
 def _subtree_raw_union(scene: Scene, obj) -> QPainterPath:

@@ -12,16 +12,18 @@ from PySide6.QtGui import (
     QTransform,
     QLinearGradient,
     QImage,
+    QCursor,
 )
 from PySide6.QtWidgets import QWidget, QLineEdit
 
-from core.commands import PropertyCommand, ReorderCommand
+from core.commands import CompoundCommand, PropertyCommand, ReorderCommand
 from core.model import Scene, SceneObject
 from core.selection import SelectionState
 from core.history import History
 from ui.theme import Theme
 from ui.stripes import StripeShader
 from ui.menus import StripeMenu, stripe_menu_open
+from ui.relative_drag import RelativeDrag
 
 from pathlib import Path
 import math
@@ -29,7 +31,6 @@ from PySide6.QtSvg import QSvgRenderer
 
 _ICONS_DIR = Path(__file__).resolve().parent.parent / "assets" / "icons"
 _svg_cache: dict = {}
-_png_cache: dict = {}
 
 
 def _load_svg(name: str):
@@ -42,21 +43,7 @@ def _load_svg(name: str):
     return _svg_cache.get(name)
 
 
-def _load_png(name: str):
-    if name not in _png_cache:
-        path = _ICONS_DIR / name
-        if path.exists():
-            img = QImage(str(path))
-            if not img.isNull():
-                _png_cache[name] = img
-    return _png_cache.get(name)
-
-
 class _InlineRenameEdit(QLineEdit):
-    """A QLineEdit that commits on Enter and cancels cleanly on Escape,
-    instead of relying on QLineEdit's ambiguous default key handling."""
-
-    committed = Signal(str)
     cancelled = Signal()
 
     def keyPressEvent(self, event):
@@ -75,7 +62,9 @@ class OutlinerWidget(QWidget):
     THUMB_SIZE = 22
     BUTTON_SIZE = 18
     INDENT = 14
-    ARROW_SIZE = 12
+    ARROW_SIZE = 18
+    THUMB_GAP = 4
+    ROW_BG_OPACITY = 0.0
     # Minimum cursor travel (px) before a press on a row turns into a
     # reorder-drag. Below this, releasing the mouse is just a click.
     DRAG_START_DISTANCE = 6
@@ -121,6 +110,15 @@ class OutlinerWidget(QWidget):
         self._drag_base_rows: list[tuple] = []
         self._drag_hidden: set[SceneObject] = set()
         self._drag_layout_snapshot: list[tuple] = []
+        # Shared relative-drag controller: hides + anchors the real cursor so
+        # a reorder never hits a screen edge / stops at the widget boundary,
+        # and measures relative motion the ghost row can follow. It draws no
+        # glyph (the row ghost is the visual feedback).
+        self._drag = RelativeDrag(self)
+        # Widget-local y at grab time, so accumulated relative dy maps back to
+        # a stable row target even though the real cursor is pinned at centre.
+        self._drag_grab_y = 0.0
+        self._accum_dy = 0.0
 
         # --- click-vs-drag distinction ---
         # A plain mouse press only records a "pending" drag candidate; the
@@ -171,6 +169,7 @@ class OutlinerWidget(QWidget):
         # change, but left untouched while the stage is mid-drag or playback
         # is running to avoid a rebuild every frame.
         self._thumb_cache = weakref.WeakKeyDictionary()
+        self._row_bg_cache = weakref.WeakKeyDictionary()
         self._thumb_frozen = False
         self.object_changed.connect(self.invalidate_thumbnails)
         # Prerendered mask-icon images keyed by (svg name, devicePixelRatio).
@@ -369,7 +368,7 @@ class OutlinerWidget(QWidget):
         return QRectF(0, i * self.ROW_HEIGHT, self.width(), self.ROW_HEIGHT)
 
     def _thumb_rect(self, row: QRectF, depth: int) -> QRectF:
-        left = row.left() + self.PADDING + depth * self.INDENT + self.ARROW_SIZE
+        left = row.left() + self.PADDING + depth * self.INDENT + self.ARROW_SIZE + self.THUMB_GAP
         return QRectF(
             left,
             row.center().y() - self.THUMB_SIZE / 2,
@@ -414,7 +413,10 @@ class OutlinerWidget(QWidget):
     # ------------------------------------------------------------------ #
     def _arrow_hit_rect(self, row: QRectF, depth: int) -> QRectF:
         arrow = self._arrow_rect(row, depth)
-        return QRectF(arrow.left(), row.top(), arrow.width(), row.height())
+        # Stretch the hitbox left to the row's left edge (the expander arrow
+        # lives at the far-left start of the row's indentation, so clicking
+        # anywhere in that strip toggles the row's expansion).
+        return QRectF(row.left(), row.top(), arrow.right() - row.left(), row.height())
 
     def _button_hit_rects(self, row: QRectF):
         gap = 4
@@ -614,6 +616,15 @@ class OutlinerWidget(QWidget):
             # re-based into their new parent's local space (no teleporting).
             old_parents = {d: self.scene.find_parent(d) for d in drag_order}
             old_world = {d: self._world_transform(d) for d in drag_order}
+
+            def _local_values(o):
+                t = o.transform
+                return (t.x, t.y, t.rotation, t.scale_x, t.scale_y)
+
+            # The reparent re-bases local transforms below; capture the old
+            # values so the move can be undone/redone as one atomic step.
+            old_local = {d: _local_values(d) for d in drag_order}
+
             # Capture old home + index for each dragged object before moving.
             moves = []
             for d in drag_order:
@@ -645,7 +656,31 @@ class OutlinerWidget(QWidget):
                     new_parent.index(d) if d in new_parent else len(new_parent)
                 )
                 final_moves.append((d, old_parent, old_idx, new_parent, new_idx))
-            self.history.push(ReorderCommand(final_moves))
+            # A parent change re-bases local transforms so the object doesn't
+            # teleport; that transform edit must be undone alongside the
+            # structural move, or undo/redo leaves objects floating at the
+            # wrong local offset under their old/new parent.
+            transform_changes = {}
+            for d in drag_order:
+                new = _local_values(d)
+                if new == old_local[d]:
+                    continue
+                attrs = {}
+                for attr, old_v, new_v in zip(
+                    ("x", "y", "rotation", "scale_x", "scale_y"),
+                    old_local[d],
+                    new,
+                ):
+                    if old_v != new_v:
+                        attrs[f"transform.{attr}"] = (old_v, new_v)
+                if attrs:
+                    transform_changes[d.id] = attrs
+            cmds = [ReorderCommand(final_moves)]
+            if transform_changes:
+                cmds.append(PropertyCommand(transform_changes))
+            self.history.push(
+                CompoundCommand(cmds) if len(cmds) > 1 else cmds[0]
+            )
         self._restore_collapsed_items()
         self._clear_drag_layout()
         self._drag_obj = None
@@ -654,7 +689,9 @@ class OutlinerWidget(QWidget):
         self._drag_active = False
         self._drag_mode = None
         self._drag_over = None
-        self.setCursor(Qt.ArrowCursor)
+        self._accum_dy = 0.0
+        self._drag.end()
+        self.releaseMouse()
         self.object_changed.emit()
         self.update()
 
@@ -790,16 +827,20 @@ class OutlinerWidget(QWidget):
             SelectionState.set_selected([obj])
             self.selection_changed.emit([obj])
 
-        self.setCursor(Qt.ClosedHandCursor)
+        self._drag_grab_y = grab_y
+        self._accum_dy = 0.0
+        self._drag.begin("none")
+        self.grabMouse()
         self.update()
 
-    def _start_multi_drag(self, clicked_obj: SceneObject, grab_y: float):
+    def _start_multi_drag(self, clicked_obj: SceneObject, grab_y: float, mode: str = "lmb"):
         """Begin dragging every selected row as one block.
 
         Anchored on ``clicked_obj`` (the row the mouse actually grabbed),
         not just the first selected item, so the ghost stack and drop
         target track the cursor correctly no matter which selected row you
-        press the mouse on.
+        press the mouse on. ``mode`` is "lmb" (released with a mouse click)
+        or "g" (released by clicking again while the selection is grabbed).
         """
         stack = self._stack_objects()
         # Keep the dragged block in on-screen (stack) order rather than
@@ -812,13 +853,16 @@ class OutlinerWidget(QWidget):
         self._drag_obj = clicked_obj
         self._drag_sel_objs = selected
         self._drag_anchor_index = anchor_index
-        self._drag_mode = "lmb"
+        self._drag_mode = mode
         self._drag_active = True
         self._drag_offset = grab_y - row_top
         self._drag_mouse_y = grab_y
         self._snapshot_layout()
         self._collapse_dragged_items()
-        self.setCursor(Qt.ClosedHandCursor)
+        self._drag_grab_y = grab_y
+        self._accum_dy = 0.0
+        self._drag.begin("none")
+        self.grabMouse()
         self.update()
 
     def _cancel_drag(self):
@@ -830,7 +874,9 @@ class OutlinerWidget(QWidget):
         self._drag_active = False
         self._drag_mode = None
         self._drag_over = None
-        self.setCursor(Qt.ArrowCursor)
+        self._accum_dy = 0.0
+        self._drag.end()
+        self.releaseMouse()
         self.update()
 
     def paintEvent(self, event):
@@ -876,7 +922,21 @@ class OutlinerWidget(QWidget):
             self._draw_hover_row(painter, row)
 
         if obj.children:
-            self._draw_arrow(painter, obj.expanded, self._arrow_rect(row, depth))
+            # get mouse's position and arrow's hitbox
+            mouse_pos = self.mapFromGlobal(QCursor.pos())
+            arrow_hit = self._arrow_hit_rect(row, depth)
+
+            # make a boolean that tells us if the arrow is hovered or not
+            is_arrow_hovered = self._mouse_hover and arrow_hit.contains(mouse_pos)
+
+            self._draw_arrow(
+                painter,
+                obj.expanded,
+                self._arrow_rect(row, depth),
+                is_hovered=is_arrow_hovered #pass that boolean there for the arrow sprite to use
+            )
+
+        self._draw_row_bg(painter, obj, row, depth)
 
         thumb = self._thumb_rect(row, depth)
         self._draw_thumb(painter, obj, thumb)
@@ -911,22 +971,36 @@ class OutlinerWidget(QWidget):
             int(row.left()), int(row.bottom()), int(row.right()), int(row.bottom())
         )
 
-    def _draw_arrow(self, painter: QPainter, expanded: bool, rect: QRectF):
+    def _draw_arrow(self, painter: QPainter, expanded: bool, rect: QRectF, is_hovered: bool):
         c = rect.center()
         s = 3.5
         path = QPainterPath()
         if expanded:
-            path.moveTo(c.x() - s, c.y() - s + 2)
-            path.lineTo(c.x() + s, c.y() - s + 2)
-            path.lineTo(c.x(), c.y() + s - 1)
+            name = "dropdown_expanded_hover.svg" if is_hovered else "dropdown_expanded.svg"
         else:
-            path.moveTo(c.x() - s + 1, c.y() - s + 1)
-            path.lineTo(c.x() + s - 1, c.y())
-            path.lineTo(c.x() - s + 1, c.y() + s - 1)
+            name = "dropdown_folded_hover.svg" if is_hovered else "dropdown_folded.svg"
+
+        renderer = _load_svg(name)
+        if renderer is not None:
+
+            renderer.render(painter, rect)
+            return
+        else:
+            if expanded:
+                path.moveTo(c.x() - s, c.y() - s + 2)
+                path.lineTo(c.x() + s, c.y() - s + 2)
+                path.lineTo(c.x(), c.y() + s - 1)
+            else:
+                path.moveTo(c.x() - s + 1, c.y() - s + 1)
+                path.lineTo(c.x() + s - 1, c.y())
+                path.lineTo(c.x() - s + 1, c.y() + s - 1)
+
+        painter.save()
         path.closeSubpath()
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(170, 170, 170))
         painter.drawPath(path)
+        painter.restore()
 
     def _draw_divider(self, painter: QPainter):
         """Divider line drawn only between two rows (snapped to a row boundary
@@ -1129,16 +1203,50 @@ class OutlinerWidget(QWidget):
         return hash(tuple(items))
 
     def _bake_thumb(self, shapes: list, bounds: QRectF, dpr: float) -> QImage:
-        """Render the thumbnail shapes once into a 16x16 (logical) image."""
-        target = QRectF(0, 0, 16, 16)
+        """Render the thumbnail shapes into a THUMB_SIZE x THUMB_SIZE image,
+        baked at device-pixel-ratio resolution so drawing it back into the
+        same-size row cell is a 1:1 blit (no upscaling, so no pixelation)."""
+        size = self.THUMB_SIZE
+        target = QRectF(0, 0, size, size)
         scale = min(
             target.width() / bounds.width() if bounds.width() > 0 else 1,
             target.height() / bounds.height() if bounds.height() > 0 else 1,
         )
         tx = target.center().x() - bounds.center().x() * scale
         ty = target.center().y() - bounds.center().y() * scale
-        w = max(1, round(16 * dpr))
-        h = max(1, round(16 * dpr))
+        w = max(1, round(size * dpr))
+        h = max(1, round(size * dpr))
+        img = QImage(w, h, QImage.Format_ARGB32)
+        img.fill(QColor(0, 0, 0, 0))
+        img.setDevicePixelRatio(dpr)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.scale(dpr, dpr)
+        p.translate(tx, ty)
+        p.scale(scale, scale)
+        p.setPen(Qt.NoPen)
+        for shape_path, color, opacity in shapes:
+            if color == "none":
+                continue
+            p.save()
+            p.setOpacity(opacity)
+            p.setBrush(QColor(color if color else "#cccccc"))
+            p.drawPath(shape_path)
+            p.restore()
+        p.end()
+        return img
+
+    def _bake_row_bg(self, shapes: list, bounds: QRectF, width: int, height: int, dpr: float) -> QImage:
+        """Render thumbnail shapes into a *width* x *height* image, scaled to
+        fill the height so the shape overflows horizontally when needed.  The
+        overflow is cropped by the clip-rect at draw time, giving a zoomed-in
+        cropped look that is much larger than the small THUMB_SIZE icon."""
+        target = QRectF(0, 0, width, height)
+        scale = height / bounds.height() if bounds.height() > 0 else 1
+        tx = target.center().x() - bounds.center().x() * scale
+        ty = target.center().y() - bounds.center().y() * scale
+        w = max(1, round(width * dpr))
+        h = max(1, round(height * dpr))
         img = QImage(w, h, QImage.Format_ARGB32)
         img.fill(QColor(0, 0, 0, 0))
         img.setDevicePixelRatio(dpr)
@@ -1168,6 +1276,7 @@ class OutlinerWidget(QWidget):
         thumbnail every frame.
         """
         self._thumb_cache.clear()
+        self._row_bg_cache.clear()
         self.update()
 
     def _draw_thumb(self, painter: QPainter, obj: SceneObject, rect: QRectF):
@@ -1204,19 +1313,17 @@ class OutlinerWidget(QWidget):
                 self._draw_container_thumb(painter, obj, rect)
             return
 
-        inner = rect.adjusted(3, 3, -3, -3)
-
         # Draw the selection outline first so it sits BEHIND the thumbnail
         # (no longer eating into the baked image's outer pixels).
         path = slot["path"]
         if self._is_selected(obj) and path is not None:
             bounds = path.boundingRect()
             scale = min(
-                inner.width() / bounds.width() if bounds.width() > 0 else 1,
-                inner.height() / bounds.height() if bounds.height() > 0 else 1,
+                rect.width() / bounds.width() if bounds.width() > 0 else 1,
+                rect.height() / bounds.height() if bounds.height() > 0 else 1,
             )
-            tx = inner.center().x() - bounds.center().x() * scale
-            ty = inner.center().y() - bounds.center().y() * scale
+            tx = rect.center().x() - bounds.center().x() * scale
+            ty = rect.center().y() - bounds.center().y() * scale
             painter.save()
             painter.translate(tx, ty)
             painter.scale(scale, scale)
@@ -1227,12 +1334,55 @@ class OutlinerWidget(QWidget):
             painter.drawPath(path)
             painter.restore()
 
-        painter.drawImage(inner, img)
+        painter.drawImage(rect, img)
+
+    def _draw_row_bg(self, painter: QPainter, obj: SceneObject, row: QRectF, depth: int):
+        """Draw the baked thumbnail, cropped and enlarged, as a faint
+        background wash across the row's name area (_name_rect). Drawn on top
+        of any selection/hover stripes but under the text, so the object stays
+        recognizable without harming readability."""
+        if self.ROW_BG_OPACITY <= 0:
+            return
+        area = self._name_rect(row, depth)
+        if area.width() <= 1 or area.height() <= 1:
+            return
+        dpr = self.devicePixelRatioF() or 1.0
+        slot = self._row_bg_cache.setdefault(obj, {})
+        img = slot.get("img")
+        use_fp = None if self._thumb_frozen else self._thumb_fp(obj)
+        if img is not None and slot.get("dpr") == dpr and slot.get("fp") == use_fp \
+                and slot.get("size") == (round(area.width()), round(area.height())):
+            img = slot["img"]
+        else:
+            slot["fp"] = use_fp
+            slot["dpr"] = dpr
+            slot["size"] = (round(area.width()), round(area.height()))
+            img = None
+            shapes = self._build_thumbnail_shapes(obj)
+            if shapes:
+                merged = QPainterPath()
+                for shape_path, _color, _op in shapes:
+                    merged.addPath(shape_path)
+                bounds = merged.boundingRect()
+                if not bounds.isEmpty():
+                    img = self._bake_row_bg(
+                        shapes, bounds,
+                        round(area.width()), round(area.height()), dpr,
+                    )
+            slot["img"] = img
+        if img is None:
+            return
+
+        painter.save()
+        painter.setClipRect(area)
+        painter.setOpacity(self.ROW_BG_OPACITY)
+        painter.drawImage(area, img)
+        painter.restore()
 
     def _draw_container_thumb(self, painter: QPainter, obj: SceneObject, rect: QRectF):
-        img = _load_png("Part.png")
-        if img is not None:
-            painter.drawImage(rect.toRect(), img)
+        renderer = _load_svg("symbol.svg")
+        if renderer is not None:
+            renderer.render(painter, rect)
             return
         inner = rect.adjusted(4, 5, -4, -5)
 
@@ -1260,24 +1410,26 @@ class OutlinerWidget(QWidget):
 
     def _build_thumbnail_shapes(self, obj: SceneObject) -> list[tuple[QPainterPath, str, float]]:
         shapes: list[tuple[QPainterPath, str, float]] = []
+        cx = obj.transform.content_x
+        cy = obj.transform.content_y
         if obj.shape_type == "rect":
             w = obj.shape_data.get("width", 100)
             h = obj.shape_data.get("height", 80)
             p = QPainterPath()
-            p.addRect(-w / 2, -h / 2, w, h)
+            p.addRect(-w / 2 + cx, -h / 2 + cy, w, h)
             shapes.append((p, obj.color, obj.opacity))
         elif obj.shape_type == "circle":
             r = obj.shape_data.get("radius", 30)
             p = QPainterPath()
-            p.addEllipse(QPointF(0, 0), r, r)
+            p.addEllipse(QPointF(cx, cy), r, r)
             shapes.append((p, obj.color, obj.opacity))
         elif obj.shape_type == "polygon":
             points = obj.shape_data.get("points", [])
             if points:
                 p = QPainterPath()
-                p.moveTo(points[0][0], points[0][1])
+                p.moveTo(points[0][0] + cx, points[0][1] + cy)
                 for pt in points[1:]:
-                    p.lineTo(pt[0], pt[1])
+                    p.lineTo(pt[0] + cx, pt[1] + cy)
                 p.closeSubpath()
                 shapes.append((p, obj.color, obj.opacity))
 
@@ -1531,6 +1683,36 @@ class OutlinerWidget(QWidget):
             self._pending_press_pos = QPointF(event.position())
             return
 
+        # Click landed on empty space (padding or below the last row) -
+        # clear the selection, Explorer-style.
+        self._update_selection(None)
+        self._selection_anchor = None
+        self._pending_obj = None
+        self._pending_multi = False
+        self._pending_press_pos = None
+        self.update()
+
+    def _update_cursor(self, pos: QPointF) -> None:
+        """Show a pointing-hand cursor while hovering any clickable sub-element
+        (expander arrow / visibility / mask / lock), arrow otherwise. Skipped
+        during an active drag or paint so the relative-drag's hidden cursor
+        (and the paint's blank one) is preserved."""
+        if self._drag_active or self._paint_active:
+            return
+        for i, (obj, depth, _pl) in enumerate(self._display_rows()):
+            row = self._row_rect(i)
+            if not row.contains(pos):
+                continue
+            if (obj.children and self._arrow_hit_rect(row, depth).contains(pos)) \
+                    or self._eye_hit_rect(row).contains(pos) \
+                    or self._mask_hit_rect(row).contains(pos) \
+                    or self._lock_hit_rect(row).contains(pos):
+                self.setCursor(Qt.PointingHandCursor)
+            else:
+                self.setCursor(Qt.ArrowCursor)
+            return
+        self.setCursor(Qt.ArrowCursor)
+
     def mouseMoveEvent(self, event):
         if self._paint_active:
             self._paint_move(event.position())
@@ -1540,6 +1722,11 @@ class OutlinerWidget(QWidget):
             delta = event.position() - self._pending_press_pos
             distance = (delta.x() ** 2 + delta.y() ** 2) ** 0.5
             if distance < self.DRAG_START_DISTANCE:
+                # Still a potential drag - keep repainting so the arrow /
+                # button hover sprites recompute from the live cursor
+                # position instead of going stale while LMB is held down.
+                self._update_cursor(event.position())
+                self.update()
                 return
             # Threshold crossed - this is now a real drag. Grab at the
             # original press point so the row doesn't jump under the cursor.
@@ -1555,15 +1742,26 @@ class OutlinerWidget(QWidget):
                 self._start_drag(pending_obj, mode="lmb", grab_y=grab_y)
 
         if self._drag_active:
-            self._drag_mouse_y = event.position().y()
+            delta = self._drag.delta(event.globalPosition().toPoint())
+            if delta is None:
+                return
+            self._accum_dy += delta[1]
+            # Map the accumulated relative motion back onto a widget-local y
+            # (the real cursor stays pinned at the centre), so the ghost row
+            # tracks the drag even once the cursor has traversed beyond the
+            # widget / screen boundary.
+            self._drag_mouse_y = self._drag_grab_y + self._accum_dy
             self._update_drag_over()
-            self.update()
+            self.repaint()
             return
+
+        pos = event.position()
+        self._update_cursor(pos)
 
         new_hovered = None
         for i, (obj, _d, _pl) in enumerate(self._display_rows()):
             row = self._row_rect(i)
-            if row.contains(event.position()):
+            if row.contains(pos):
                 new_hovered = obj
                 break
 
@@ -1574,9 +1772,10 @@ class OutlinerWidget(QWidget):
             # Repaint both the row losing hover and the row gaining it so
             # the gray stripe highlight appears/disappears immediately
             # instead of waiting for the next 33ms animation tick.
-            for i, (obj, _d, _pl) in enumerate(self._display_rows()):
-                if obj is old_hovered or obj is new_hovered:
-                    self.update(self._row_rect(i).toRect())
+        # Repaint so the arrow/button hover sprites track the cursor even
+        # when it moves within a single row (the hovered object doesn't
+        # change, but which sub-element is hovered does).
+        self.update()
 
     def mouseReleaseEvent(self, event):
         if event.button() != Qt.LeftButton:
@@ -1651,6 +1850,8 @@ class OutlinerWidget(QWidget):
                     self.update(self._row_rect(i).toRect())
                     break
         self._mouse_hover = False
+        if not self._drag_active:
+            self.setCursor(Qt.ArrowCursor)
         super().leaveEvent(event)
 
     def enterEvent(self, event):
@@ -1667,22 +1868,32 @@ class OutlinerWidget(QWidget):
                 self._cancel_drag()
             return
 
-        if key == Qt.Key_G and self._mouse_hover:
-            obj = self._object_at_y(event.position().y())
-            if obj is not None:
-                if len(SelectionState.selected()) > 1 and obj in SelectionState.selected():
-                    self._start_multi_drag(obj, grab_y=event.position().y())
-                else:
-                    self._start_drag(obj, mode="g", grab_y=event.position().y())
+        if key == Qt.Key_G and self._cursor_over_widget():
+            # Same gather-style pattern as stage.py: G works anywhere the
+            # cursor is inside this dock. It moves exactly the currently
+            # selected rows - it never cares which row is hovered and never
+            # changes the selection. QKeyEvent has no position(), so anchor
+            # on the live cursor location, keeping the top-most selected
+            # row locked to its current screen offset (no snap to cursor).
+            pos = self.mapFromGlobal(QCursor.pos())
+            if SelectionState.selected():
+                stack = self._stack_objects()
+                # Selected rows in on-screen (stack) order.
+                selected = [o for o in stack if o in SelectionState.selected()]
+                if selected:
+                    # Anchor on the top-most selected row so the whole
+                    # block keeps its place under the cursor and only
+                    # moves by the user's drag delta.
+                    self._start_multi_drag(selected[0], grab_y=pos.y(), mode="g")
 
     def keyPressEvent(self, event):
         self.handle_key_press(event)
 
-    def _object_at_y(self, y: float) -> SceneObject | None:
-        for i, (obj, _d, _pl) in enumerate(self._display_rows()):
-            if self._row_rect(i).contains(QPointF(0, y)):
-                return obj
-        return None
+    def _cursor_over_widget(self) -> bool:
+        """True when the cursor is inside this dock. Same pattern as
+        stage.py's ``_cursor_over_viewport`` - lets G work anywhere over the
+        list, including empty space below the rows."""
+        return self.rect().contains(self.mapFromGlobal(QCursor.pos()))
 
     # ------------------------------------------------------------------ #
     # Icon toggles (visibility / mask / lock), multi-selection aware

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import uuid
 from pathlib import Path
 
 from core.model import INTERPOLATION_MODES, Keyframe, Scene, SceneObject, Transform
@@ -29,16 +30,20 @@ def _serialize_transform(t: Transform) -> dict:
         "rotation": t.rotation,
         "scale_x": t.scale_x,
         "scale_y": t.scale_y,
+        "content_offset": {"x": t.content_x, "y": t.content_y},
     }
 
 
 def _deserialize_transform(d: dict) -> Transform:
+    content_offset = d.get("content_offset") or {}
     return Transform(
         x=d.get("x", 0.0),
         y=d.get("y", 0.0),
         rotation=d.get("rotation", 0.0),
         scale_x=d.get("scale_x", 1.0),
         scale_y=d.get("scale_y", 1.0),
+        content_x=content_offset.get("x", 0.0),
+        content_y=content_offset.get("y", 0.0),
     )
 
 
@@ -143,3 +148,58 @@ def load_scene_from_file(path: str | Path) -> Scene:
         raw = data.decode("utf-8")
     parsed = json.loads(raw)
     return deserialize_scene(parsed)
+
+
+SYMBOL_VERSION = 1
+
+
+def serialize_symbol(symbol: SceneObject) -> dict:
+    """Serialize a single Symbol (a container subtree) for a .sym file."""
+    return {
+        "sym_version": SYMBOL_VERSION,
+        "symbol": _serialize_object(symbol),
+    }
+
+
+def _reassign_ids(obj: SceneObject) -> None:
+    """Give every object in a subtree a fresh unique id.
+
+    Symbol files preserve each object's id, so importing a copy of a symbol
+    that already lives in the scene would otherwise produce duplicate ids. Many
+    systems key data by ``obj.id`` (notably mask bases: an erase mask's hole is
+    looked up by the id of the object it clips), so two objects sharing an id
+    would mutually interfere - e.g. one circle's mask clipping every rectangle
+    that happens to share its id. Fresh ids keep an import fully independent.
+    """
+    obj.id = uuid.uuid4().hex[:8]
+    for child in obj.children:
+        _reassign_ids(child)
+
+
+def deserialize_symbol(data: dict) -> SceneObject:
+    """Deserialize a Symbol (a container subtree) from a .sym file."""
+    symbol = _deserialize_object(data.get("symbol", {}))
+    if not symbol.is_container:
+        raise ValueError("Not a valid Symbol: the .sym file root is not a container")
+    _reassign_ids(symbol)
+    return symbol
+
+
+def export_symbol_to_file(symbol: SceneObject, path: str | Path) -> None:
+    """Write a single Symbol to a gzip-compressed .sym file."""
+    path = Path(path)
+    raw = json.dumps(serialize_symbol(symbol), indent=2).encode("utf-8")
+    with gzip.open(path, "wb", compresslevel=9) as f:
+        f.write(raw)
+
+
+def import_symbol_from_file(path: str | Path) -> SceneObject:
+    """Load a single Symbol from a .sym file."""
+    path = Path(path)
+    data = path.read_bytes()
+    if data.startswith(_GZIP_MAGIC):
+        raw = gzip.decompress(data).decode("utf-8")
+    else:
+        raw = data.decode("utf-8")
+    parsed = json.loads(raw)
+    return deserialize_symbol(parsed)

@@ -11,11 +11,11 @@ from PySide6.QtGui import (
     QPen,
     QFontMetrics,
     QPainterPath,
-    QCursor,
 )
 from PySide6.QtWidgets import QWidget, QSizePolicy, QApplication
 
 from ui.theme import Theme
+from ui.relative_drag import RelativeDrag
 
 _DRAG_START_PIXELS = 2.0
 _SHIFT_SCALE = 0.1
@@ -180,16 +180,18 @@ class NumericField(QWidget):
 
         # scrub state
         self._press_global_x = 0.0
-        self._press_global_y = 0.0
-        self._last_x = 0.0
-        self._last_value = 0.0
         self._scrubbing = False
         self._pressed = False
 
         # undo-friendly scrub reporting - True between scrub_started/finished
         self._scrub_reported = False
 
-        self._cursor_locked = False  # True while scrubbing hides the cursor
+        # Shared relative-drag controller: hides + anchors the real cursor so a
+        # scrub never stalls at the screen/window edge, and returns per-event
+        # relative deltas the value can follow directly. It draws no glyph -
+        # the number + accent fill bar are the feedback.
+        self._drag = RelativeDrag(self)
+
         self._hovered = False
 
         self.setMouseTracking(True)
@@ -418,9 +420,6 @@ class NumericField(QWidget):
         self._pressed = True
         self._scrubbing = False
         self._press_global_x = event.globalPosition().x()
-        self._press_global_y = event.globalPosition().y()
-        self._last_x = self._press_global_x
-        self._last_value = self._value
         event.accept()
 
     def mouseMoveEvent(self, event):
@@ -428,34 +427,35 @@ class NumericField(QWidget):
             super().mouseMoveEvent(event)
             return
         x = event.globalPosition().x()
-        if x == self._last_x:
-            event.accept()
-            return
         if not self._scrubbing:
+            # The press hasn't crossed the scrub threshold yet - a plain click
+            # on release still just selects/edits. Swallow it so a held press
+            # without any motion doesn't fall through to hover handling.
             if abs(x - self._press_global_x) < _DRAG_START_PIXELS:
                 return
             if self._editing:
                 self._commit()
             self._scrubbing = True
-            self._last_x = self._press_global_x
-            self._last_value = self._value
             self._start_scrub_reporting()
-            QApplication.setOverrideCursor(Qt.BlankCursor)
-            self._cursor_locked = True
+            # Hide + anchor the real cursor; each delta() - not a tracked
+            # absolute position - drives the value, so the drag never hits an
+            # edge or stops at the widget boundary.
+            self._drag.begin("none")
             self.grabMouse()
-        dx = x - self._last_x
+            event.accept()
+            return
+
+        delta = self._drag.delta(event.globalPosition().toPoint())
+        if delta is None:
+            event.accept()
+            return
+        dx = delta[0]
         factor = _SHIFT_SCALE if (event.modifiers() & Qt.ShiftModifier) else 1.0
         dx_eff = dx * self._scrub_step * factor
 
         # Directly adjust the continuous float accumulator
         self.setValue(self._value + dx_eff)
-        self.update()
-
-        QCursor.setPos(int(self._press_global_x), int(self._press_global_y))
-        if QCursor.pos().x() == int(self._press_global_x):
-            self._last_x = float(int(self._press_global_x))
-        else:
-            self._last_x = x
+        self.repaint()
         event.accept()
 
     def mouseReleaseEvent(self, event):
@@ -468,9 +468,10 @@ class NumericField(QWidget):
         self._scrubbing = False
         if was_scrubbing:
             self.releaseMouse()
-            if self._cursor_locked:
-                QApplication.restoreOverrideCursor()
-                self._cursor_locked = False
+            # No fake-cursor glyph to come home to, so put the real cursor
+            # back exactly where the user started the scrub rather than at
+            # the (wrapped) end position of the invisible phantom.
+            self._drag.end(restore_to_start=True)
             self._finish_scrub_reporting()
         if was_pressed and not was_scrubbing:
             self.setFocus(Qt.MouseFocusReason)

@@ -9,6 +9,7 @@ Public API mirrors the parts of QMenu the app actually uses:
 
     menu = StripeMenu()
     menu.add_action("Wrap", callback, checkable=True, checked=..., data=...)
+    menu.add_action("Mode", callback, description="What this option does")
     menu.add_section("Interpolation Mode")
     menu.add_separator()
     chosen = menu.exec(global_point)   # blocking, returns chosen action or None
@@ -18,6 +19,10 @@ Public API mirrors the parts of QMenu the app actually uses:
     bar = StripeMenuBar()
     file_menu = bar.add_menu("&File")
     file_menu.add_action("&Open...", callback, shortcut="Ctrl+O")
+
+When an action carries a ``description``, hover over it pops up a small
+floating tooltip beside the menu (right side, or left when there's no room).
+No description means no tooltip.
 """
 
 from __future__ import annotations
@@ -47,12 +52,12 @@ class StripeMenuAction:
 
     __slots__ = (
         "text", "callback", "checkable", "checked", "data",
-        "shortcut_text", "section", "separator", "enabled",
+        "shortcut_text", "section", "separator", "enabled", "description",
     )
 
     def __init__(self, text="", callback=None, checkable=False, checked=False,
                  data=None, shortcut_text="", section=False, separator=False,
-                 enabled=True):
+                 enabled=True, description=""):
         self.text = text
         self.callback = callback
         self.checkable = checkable
@@ -62,6 +67,7 @@ class StripeMenuAction:
         self.section = section
         self.separator = separator
         self.enabled = enabled
+        self.description = description
 
 
 def _paint_tilted_accent(painter: QPainter, rect: QRectF, clip: QPainterPath):
@@ -142,6 +148,65 @@ def stripe_menu_open() -> bool:
     return bool(_OPEN_MENUS)
 
 
+class _DescriptionPopup(QWidget):
+    """Small floating tooltip that shows an action's description next to a StripeMenu.
+
+    Rendered the SAME way as the menu popup itself: a plain child widget
+    embedded inside the hosting window (never its own top-level window), so it
+    can never appear as a separate task-bar entry. It is transparent for the
+    mouse so it never blocks clicks, and must be parented to the hosting
+    window (not the menu) before being shown, otherwise Qt clips any part that
+    sticks out beyond the menu's own bounds.
+    """
+
+    PAD_X = 10
+    PAD_Y = 6
+    GAP = 8
+    MIN_W = 80
+    MAX_W = 300
+    CORNER = 4
+
+    def __init__(self):
+        super().__init__()
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._text = ""
+
+    def set_description(self, text: str):
+        self._text = text
+        if not text:
+            self.hide()
+            return
+        font = self.font()
+        font.setPointSize(10)
+        fm = QFontMetrics(font)
+        constrained_w = self.MAX_W - 2 * self.PAD_X
+        text_rect = fm.boundingRect(
+            QRect(0, 0, constrained_w, 10000),
+            Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap,
+            text,
+        )
+        w = self.PAD_X * 2 + max(text_rect.width(), self.MIN_W - 2 * self.PAD_X)
+        h = self.PAD_Y * 2 + text_rect.height()
+        self.setFixedSize(int(w), int(h))
+        self.update()
+
+    def paintEvent(self, event):
+        if not self._text:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QPen(QColor(100, 100, 100), 1))
+        painter.setBrush(QColor(30, 30, 30))
+        painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), self.CORNER, self.CORNER)
+        font = self.font()
+        font.setPointSize(10)
+        painter.setFont(font)
+        painter.setPen(QColor(200, 200, 200))
+        text_rect = self.rect().adjusted(self.PAD_X, self.PAD_Y, -self.PAD_X, -self.PAD_Y)
+        painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, self._text)
+        painter.end()
+
+
 class StripeMenu(QWidget):
     """A borderless popup menu that is embedded inside the app window.
 
@@ -156,7 +221,7 @@ class StripeMenu(QWidget):
     H_PAD = 12
     CHECK_W = 20
     SHORTCUT_GAP = 28
-    SEP_H = 9
+    SEP_H = 0
     SECTION_H = 24
     CORNER = 6
 
@@ -202,14 +267,20 @@ class StripeMenu(QWidget):
         self._anim_timer.timeout.connect(self._tick)
 
         self._width = 220
-        self._text_metrics = QFontMetrics(self.font())
+        _font = self.font()
+        _font.setBold(True)
+        _font.setPointSize(11)
+        self._text_metrics = QFontMetrics(_font)
         self._shortcuts: list[QShortcut] = []
+        self._desc_popup = _DescriptionPopup()
+        self._desc_popup.hide()
 
     # -- construction ------------------------------------------------------
     def add_action(self, text="", callback=None, checkable=False, checked=False,
-                   data=None, shortcut_text="") -> StripeMenuAction:
+                   data=None, shortcut_text="", description="") -> StripeMenuAction:
         action = StripeMenuAction(text=text, callback=callback, checkable=checkable,
-                                  checked=checked, data=data, shortcut_text=shortcut_text)
+                                  checked=checked, data=data, shortcut_text=shortcut_text,
+                                  description=description)
         self._actions.append(action)
         if shortcut_text and callback is not None:
             seq = QKeySequence(shortcut_text)
@@ -267,6 +338,55 @@ class StripeMenu(QWidget):
             y += self.item_height(self._actions[i])
         return QRectF(0, y, self.width(), self.item_height(self._actions[index]))
 
+    def _update_description_popup(self) -> None:
+        """Show or hide the description tooltip based on the current hover.
+
+        The tooltip is embedded INSIDE the same hosting window as the menu
+        (a plain child widget, never its own top-level window - just like the
+        menu popup itself), placed to the right of the menu in window-local
+        coordinates, or to the left when there's no room, aligned with the
+        hovered row and clamped to the window bounds.
+        """
+        if (self._hover_index >= 0
+                and self._hover_index < len(self._actions)):
+            action = self._actions[self._hover_index]
+            if action.description and not action.separator and not action.section and action.enabled:
+                row = self._action_rect(self._hover_index)
+                self._desc_popup.set_description(action.description)
+
+                # Embed into the menu's window (the host), never into the menu
+                # itself: a child widget positioned outside its parent's bounds
+                # is clipped by Qt, so the popup would be cut off right of the
+                # menu column. As a sibling of the menu inside the host it
+                # renders exactly like the menu does.
+                window = self.window()
+                if window is None:
+                    window = self
+                if self._desc_popup.parent() is not window:
+                    self._desc_popup.setParent(window)
+                    self._desc_popup.setWindowFlags(Qt.Widget)
+
+                # Menu's top-left in window-local coordinates.
+                menu_local = window.mapFromGlobal(self.mapToGlobal(QPoint(0, 0)))
+                pw = self._desc_popup.width()
+                ph = self._desc_popup.height()
+
+                popup_x = menu_local.x() + self.width() + _DescriptionPopup.GAP
+                if popup_x + pw > window.width():
+                    popup_x = menu_local.x() - _DescriptionPopup.GAP - pw
+                if popup_x < 0:
+                    popup_x = 0
+
+                popup_y = menu_local.y() + int(row.y())
+                if popup_y + ph > window.height():
+                    popup_y = max(0, window.height() - ph)
+
+                self._desc_popup.move(popup_x, popup_y)
+                self._desc_popup.raise_()
+                self._desc_popup.show()
+                return
+        self._desc_popup.hide()
+
     # -- display -----------------------------------------------------------
     def _resolve_host(self, pos: QPoint):
         """Return the top-level widget the popup should be embedded in."""
@@ -316,6 +436,7 @@ class StripeMenu(QWidget):
         like a single fast gesture.
         """
         self._hover_index = -1
+        self._desc_popup.hide()
         self._result = None
         self._press_activated = False
         self._trigger_key = trigger_key
@@ -354,14 +475,23 @@ class StripeMenu(QWidget):
         return self._result
 
     def _measure_width(self) -> int:
+        font = self.font()
+        font.setBold(True)
+        font.setPointSize(11)
+        fm = QFontMetrics(font)
         w = 40
         for a in self._actions:
             if a.separator:
                 continue
-            text_w = self._text_metrics.horizontalAdvance(a.text.replace("&", ""))
+            if a.section:
+                font_s = self.font()
+                font_s.setBold(True)
+                font_s.setPointSizeF(font_s.pointSizeF() - 0.5)
+                fm = QFontMetrics(font_s)
+            text_w = fm.horizontalAdvance(a.text.replace("&", ""))
             total = self.H_PAD + (self.CHECK_W if a.checkable else 0) + self.H_PAD + text_w
             if a.shortcut_text:
-                total += self.SHORTCUT_GAP + self._text_metrics.horizontalAdvance(a.shortcut_text)
+                total += self.SHORTCUT_GAP + fm.horizontalAdvance(a.shortcut_text)
             if a.section:
                 total = self.H_PAD * 2 + text_w
             w = max(w, total)
@@ -385,6 +515,7 @@ class StripeMenu(QWidget):
         self._finish()
 
     def _finish(self):
+        self._desc_popup.hide()
         self.hide()
         if self._loop is not None:
             self._loop.quit()
@@ -393,6 +524,7 @@ class StripeMenu(QWidget):
         idx = self._index_at(event.position().x(), event.position().y())
         if idx != self._hover_index:
             self._hover_index = idx
+            self._update_description_popup()
             self.update()
         super().mouseMoveEvent(event)
 
@@ -408,6 +540,7 @@ class StripeMenu(QWidget):
             idx = self._index_at(local.x(), local.y())
             if idx != self._hover_index:
                 self._hover_index = idx
+                self._update_description_popup()
         self.update()
 
     def mousePressEvent(self, event):
@@ -442,6 +575,7 @@ class StripeMenu(QWidget):
         idx = self._index_at(local.x(), local.y())
         if idx != self._hover_index:
             self._hover_index = idx
+            self._update_description_popup()
             self.update()
 
     def _release_from_global(self, global_pos) -> None:
@@ -464,6 +598,7 @@ class StripeMenu(QWidget):
 
     def leaveEvent(self, event):
         self._hover_index = -1
+        self._update_description_popup()
         self.update()
         super().leaveEvent(event)
 
@@ -476,10 +611,12 @@ class StripeMenu(QWidget):
         if event.key() in (Qt.Key_Up, Qt.Key_K):
             pos = interactive.index(self._hover_index) if self._hover_index in interactive else -1
             self._hover_index = interactive[(pos - 1) % len(interactive)]
+            self._update_description_popup()
             self.update()
         elif event.key() in (Qt.Key_Down, Qt.Key_J):
             pos = interactive.index(self._hover_index) if self._hover_index in interactive else -1
             self._hover_index = interactive[(pos + 1) % len(interactive)]
+            self._update_description_popup()
             self.update()
         elif event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
             if self._hover_index >= 0:
@@ -521,8 +658,13 @@ class StripeMenu(QWidget):
             h = self.item_height(action)
 
             if action.separator:
-                painter.setPen(QPen(QColor(80, 80, 80), 1))
-                painter.drawLine(0, int(y + h / 2), self.width(), int(y + h / 2))
+                # Purely visual: the separator takes 0 pixels of height and is
+                # drawn as a hairline on the shared boundary between the rows
+                # above and below, only when there is content on both sides.
+                if (any(not a.separator for a in self._actions[:i])
+                        and any(not a.separator for a in self._actions[i + 1:])):
+                    painter.setPen(QPen(QColor(80, 80, 80), 1))
+                    painter.drawLine(0, int(y), self.width(), int(y))
                 y += h
                 continue
 

@@ -20,7 +20,12 @@ from core.selection import SelectionState
 from core.animation import apply_interpolation
 from core.commands import AddObjectCommand
 from core.history import History
-from core.save import save_scene_to_file, load_scene_from_file
+from core.save import (
+    save_scene_to_file,
+    load_scene_from_file,
+    export_symbol_to_file,
+    import_symbol_from_file,
+)
 from rendering.svg import import_svg_simple
 from ui.stage import StageWidget
 from ui.timeline import TimelineWidget, TimelineTransport
@@ -101,30 +106,47 @@ class MainWindow(QMainWindow):
     def _setup_menus(self):
         file_menu = self._menubar.add_menu("&File")
 
-        open_action = file_menu.add_action("&Open...", callback=lambda checked: self._open(), shortcut_text="Ctrl+O")
+        open_action = file_menu.add_action("&Open...", callback=lambda checked: self._open(), shortcut_text="Ctrl+O",
+                                           description="Open a saved project file")
 
         file_menu.add_separator()
 
-        file_menu.add_action("&Save", callback=lambda checked: self._save(), shortcut_text="Ctrl+S")
-        file_menu.add_action("Save &As...", callback=lambda checked: self._save_as(), shortcut_text="Ctrl+Shift+S")
-        file_menu.add_action("Save Copy...", callback=lambda checked: self._save_copy(), shortcut_text="Ctrl+Alt+S")
+        file_menu.add_action("&Save", callback=lambda checked: self._save(), shortcut_text="Ctrl+S",
+                             description="Save the project to its current file")
+        file_menu.add_action("Save &As...", callback=lambda checked: self._save_as(), shortcut_text="Ctrl+Shift+S",
+                             description="Save the project under a new file")
+        file_menu.add_action("Save Copy...", callback=lambda checked: self._save_copy(), shortcut_text="Ctrl+Alt+S",
+                             description="Save a copy of the project, keeping the current file")
 
         file_menu.add_separator()
 
-        file_menu.add_action("&Import SVG...", callback=lambda checked: self._import_svg())
+        file_menu.add_action("&Import SVG...", callback=lambda checked: self._import_svg(),
+                             description="Import vector artwork from an SVG file")
+        file_menu.add_action("&Import Symbol...", callback=lambda checked: self._import_symbol(),
+                             description="Import a reusable symbol into the project")
 
         file_menu.add_separator()
-        file_menu.add_action("E&xit", callback=lambda checked: self.close(), shortcut_text="Ctrl+Q")
+
+        file_menu.add_action("&Export Symbol...", callback=lambda checked: self._export_symbol(),
+                             description="Export a symbol back to an SVG file")
+
+        file_menu.add_separator()
+        file_menu.add_action("E&xit", callback=lambda checked: self.close(), shortcut_text="Ctrl+Q",
+                             description="Close the application")
 
         edit_menu = self._menubar.add_menu("&Edit")
 
-        self.undo_action = edit_menu.add_action("&Undo", callback=lambda checked: self._undo(), shortcut_text="Ctrl+Z")
-        self.redo_action = edit_menu.add_action("&Redo", callback=lambda checked: self._redo(), shortcut_text="Ctrl+Shift+Z")
+        self.undo_action = edit_menu.add_action("&Undo", callback=lambda checked: self._undo(), shortcut_text="Ctrl+Z",
+                                                description="Undo the last change")
+        self.redo_action = edit_menu.add_action("&Redo", callback=lambda checked: self._redo(), shortcut_text="Ctrl+Shift+Z",
+                                                description="Redo the last undone change")
 
         render_menu = self._menubar.add_menu("&Render")
 
-        self.render_image_action = render_menu.add_action("&Image", callback=lambda checked: self._render_image(), shortcut_text="Ctrl+F12")
-        self.render_video_action = render_menu.add_action("&Video", callback=lambda checked: self._render_video(), shortcut_text="F12")
+        self.render_image_action = render_menu.add_action("&Image", callback=lambda checked: self._render_image(), shortcut_text="Ctrl+F12",
+                                                          description="Render the current frame as an image")
+        self.render_video_action = render_menu.add_action("&Video", callback=lambda checked: self._render_video(), shortcut_text="F12",
+                                                          description="Render the animation as a video file")
 
     def _render_image(self):
         self._open_render_window("image")
@@ -165,6 +187,48 @@ class MainWindow(QMainWindow):
             )
         except (ValueError, OSError) as e:
             QMessageBox.warning(self, "Import Error", str(e))
+
+    def _import_symbol(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Symbol", "", "Symbol Files (*.sym)"
+        )
+        if not path:
+            return
+        try:
+            symbol = import_symbol_from_file(path)
+        except (ValueError, OSError, KeyError) as e:
+            QMessageBox.warning(self, "Import Error", str(e))
+            return
+        self.scene.objects.append(symbol)
+        self.history.push(AddObjectCommand(symbol, self.scene.objects))
+        self._update_all()
+        self.statusBar().showMessage(f"Imported {Path(path).name} as a Symbol")
+
+    def _export_symbol(self):
+        selected = SelectionState.selected()
+        symbols = [s for s in selected if s.is_container]
+        if len(symbols) != 1:
+            QMessageBox.information(
+                self,
+                "Export Symbol",
+                "Select exactly one Symbol (a container) to export.",
+            )
+            return
+        symbol = symbols[0]
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Symbol", "", "Symbol Files (*.sym)"
+        )
+        if not path:
+            return
+        if not path.endswith(".sym"):
+            path += ".sym"
+        try:
+            export_symbol_to_file(symbol, path)
+            self.statusBar().showMessage(
+                f"Exported {symbol.name} to {Path(path).name}"
+            )
+        except OSError as e:
+            QMessageBox.warning(self, "Export Error", str(e))
 
     def _open(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -244,8 +308,12 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Redo")
 
     def _after_history_change(self):
-        obj = self.scene.get_object_by_id(self.history.selected_id) if self.history.selected_id else None
-        SelectionState.set_selected([obj] if obj else [])
+        objects = []
+        for oid in self.history.selected_ids:
+            obj = self.scene.get_object_by_id(oid)
+            if obj is not None:
+                objects.append(obj)
+        SelectionState.set_selected(objects)
         SelectionState.set_hovered(None)
         for stage in self._docks_of(StageWidget):
             stage.hovered_object = None
@@ -459,6 +527,14 @@ class MainWindow(QMainWindow):
         # dock-switch menu would lose its keyboard interaction.
         if QApplication.activePopupWidget() is not None:
             return
+        # During an active relative drag (hidden fake-cursor gesture) the real
+        # cursor is parked at the gesture anchor but may still briefly roam;
+        # yanking focus to whatever dock it passes over would focusOutEvent the
+        # dragging dock and cancel the transform mid-drag.
+        for slot in self._slots:
+            drag = getattr(slot.current_widget(), "_drag", None)
+            if drag is not None and getattr(drag, "active", False):
+                return
         dock = self._dock_under_cursor()
         if dock is None:
             return
@@ -481,11 +557,11 @@ class MainWindow(QMainWindow):
 
     def _on_selection_changed(self, obj):
         # Selection state is global (core.selection.SelectionState), so there's
-        # nothing to copy between docks. Just persist it to history (using the
-        # primary selected object for the undo/redo selection) and refresh
-        # cross-dock hover highlights.
-        primary = SelectionState.selected()[0] if SelectionState.selected() else None
-        self.history.save_selection(primary.id if primary else None)
+        # nothing to copy between docks. Just persist it to history (the whole
+        # selection list, so undo/redo restores multi-selections too) and
+        # refresh cross-dock hover highlights.
+        selected_ids = [o.id for o in SelectionState.selected()]
+        self.history.save_selection(selected_ids)
         for stage in self._docks_of(StageWidget):
             stage.hovered_object = None
         for timeline in self._docks_of(TimelineWidget):
@@ -534,8 +610,8 @@ class MainWindow(QMainWindow):
 
     def _on_outliner_selected(self, objects):
         # Selection state is already global; just persist + refresh hover.
-        primary = objects[0] if objects else None
-        self.history.save_selection(primary.id if primary else None)
+        selected_ids = [o.id for o in objects]
+        self.history.save_selection(selected_ids)
         for stage in self._docks_of(StageWidget):
             stage.hovered_object = None
         for timeline in self._docks_of(TimelineWidget):

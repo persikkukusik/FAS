@@ -15,6 +15,7 @@ from core.selection import (
 )
 from ui.theme import Theme
 from ui.menus import stripe_menu_open
+from ui.relative_drag import RelativeDrag
 
 
 class TimelineWidget(QWidget):
@@ -64,6 +65,13 @@ class TimelineWidget(QWidget):
         self._drag_keyframes: list[list] = []
         self._scale_start_dists: list[float] = []
         self._scale_mid = 0.0
+        # Shared relative-drag controller: hides the real cursor and anchors it
+        # so keyframe drags never steal focus, and drives the fake cursor.
+        self._drag = RelativeDrag(self)
+        # Total horizontal pixel movement accumulated from the controller's
+        # per-move deltas this gesture (a plain absolute cursor delta would not
+        # survive the controller re-anchoring the real cursor every move).
+        self._accum_dx = 0.0
         # Pending "insert" actions from _duplicate_selected, folded into the
         # transform's CompoundCommand at confirm/cancel.
         self._pending_insert_cmd: list[tuple] | None = None
@@ -152,6 +160,10 @@ class TimelineWidget(QWidget):
         # The label panel is drawn last, unclipped, so it always sits on top
         # of the timeline content and keeps its own dedicated space.
         self._draw_labels(painter)
+
+        # The relative-drag fake cursor (drawn during keyframe move/scale) sits
+        # on top, in plain widget-local space.
+        self._drag.paint(painter)
 
         painter.end()
 
@@ -753,10 +765,14 @@ class TimelineWidget(QWidget):
 
     def _enter_move(self, start_frames: list[int], keyframes: list[list]):
         self._transform_mode = "move"
+        # Keep the initial cursor x: it seeds the scale-style absolute distance
+        # tracking if we ever need it, and `_accum_dx` measures relative motion.
         self._drag_start = QPointF(self.cursor().pos())
+        self._accum_dx = 0.0
         self._start_frames = list(start_frames)
         self._drag_keyframes = list(keyframes)
-        self.setCursor(Qt.CrossCursor)
+        self._drag.begin("cross")
+        self.grabMouse()
         self.status_message.emit("Move keyframes: move mouse, click to confirm, Esc to cancel")
         self.update()
 
@@ -778,12 +794,14 @@ class TimelineWidget(QWidget):
             sel.frame = new_frame
 
     def _update_move(self, pos: QPointF):
-        g = self.cursor().pos()
-        delta_x = g.x() - self._drag_start.x()
-        delta_frames = round(delta_x / self._frame_width)
+        delta = self._drag.delta(self.cursor().pos())
+        if delta is None:
+            return
+        self._accum_dx += delta[0]
+        delta_frames = round(self._accum_dx / self._frame_width)
         self._apply_moved_frames(self._start_frames, delta_frames)
         self._refresh_interpolation()
-        self.update()
+        self.repaint()
 
     def _confirm_transform(self):
         start_frames = (
@@ -804,6 +822,8 @@ class TimelineWidget(QWidget):
                     )
                 )
         self._transform_mode = None
+        self._drag.end()
+        self.releaseMouse()
         self.setCursor(Qt.ArrowCursor)
         self.setFocus()
         self.status_message.emit("Ready")
@@ -873,6 +893,8 @@ class TimelineWidget(QWidget):
                 kf.frame = start_frame
             sel.frame = start_frame
         self._transform_mode = None
+        self._drag.end()
+        self.releaseMouse()
         self.setCursor(Qt.ArrowCursor)
         self.setFocus()
         self.status_message.emit("Ready")
@@ -905,7 +927,9 @@ class TimelineWidget(QWidget):
         origin_global_x = self.mapToGlobal(self.rect().topLeft()).x()
         self._scale_pivot_global_x = origin_global_x + pivot_widget_x
         self._scale_factor = 1.0
-        self.setCursor(Qt.CrossCursor)
+        self._accum_dx = 0.0
+        self._drag.begin("cross")
+        self.grabMouse()
         self.status_message.emit(
             "Scale keyframes (pivot: playhead): move horizontally, click to confirm, Esc to cancel"
         )
@@ -914,11 +938,14 @@ class TimelineWidget(QWidget):
     def _update_scale(self, pos: QPointF):
         if not self._scale_start_dists:
             return
-        g = self.cursor().pos()
+        delta = self._drag.delta(self.cursor().pos())
+        if delta is None:
+            return
+        self._accum_dx += delta[0]
         pivot_x = self._scale_pivot_global_x
 
         start_dist = self._drag_start.x() - pivot_x
-        cur_dist = g.x() - pivot_x
+        cur_dist = start_dist + self._accum_dx
         if start_dist == 0:
             factor = 1.0
         else:
@@ -938,7 +965,7 @@ class TimelineWidget(QWidget):
                 kf.frame = new_frame
             sel.frame = new_frame
         self._refresh_interpolation()
-        self.update()
+        self.repaint()
 
     # ------------------------------------------------------------------ #
     # Interpolation menu (T)

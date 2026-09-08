@@ -11,9 +11,19 @@ class Transform:
     rotation: float = 0.0
     scale_x: float = 1.0
     scale_y: float = 1.0
+    content_x: float = 0.0
+    content_y: float = 0.0
 
     def copy(self) -> Transform:
-        return Transform(self.x, self.y, self.rotation, self.scale_x, self.scale_y)
+        return Transform(
+            self.x,
+            self.y,
+            self.rotation,
+            self.scale_x,
+            self.scale_y,
+            self.content_x,
+            self.content_y,
+        )
 
 
 INTERPOLATION_MODES = ("constant", "linear", "adaptive")
